@@ -29,13 +29,19 @@ Decrypt with the same key:
 cat secret.enc | ssh-agent-crypt -decrypt > secret.txt
 ```
 
-Pick a specific `ssh-agent` identity by public key path, comment, SHA256 fingerprint, or MD5 fingerprint:
+Pick a specific key from your agent by public key path, comment, SHA256 fingerprint, or MD5 fingerprint:
 
 ```bash
 ssh-agent-crypt id_ed25519.pub < secret.txt > secret.enc
 ssh-agent-crypt user@host < secret.txt > secret.enc
 ssh-agent-crypt SHA256:abc123... < secret.txt > secret.enc
 ssh-agent-crypt MD5:aa:bb:cc:dd:... < secret.txt > secret.enc
+```
+
+You can also use `ssh-agent-crypt` with a direct private key file, with no need for an agent running:
+
+```bash
+ssh-agent-crypt ~/.ssh/id_ed25519 < secret.txt > secret.enc
 ```
 
 ## What It Does

@@ -177,6 +177,26 @@ test("rejects ecdsa identities", async () => {
   });
 });
 
+test("round-trips with a private key path without ssh-agent", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-agent-crypt-"));
+  const env = {...process.env};
+  delete env.SSH_AUTH_SOCK;
+  delete env.SSH_AGENT_PID;
+
+  try {
+    const local = createKey(tmpDir, "local@test");
+    const plaintext = "local private key works\n";
+    const encrypted = run("bash", [CLI_PATH, local.privateKey], {env, input: plaintext});
+    assertSuccess(encrypted, "encrypt with private key path");
+
+    const decrypted = run("bash", [CLI_PATH, "-decrypt", local.privateKey], {env, input: encrypted.stdout});
+    assertSuccess(decrypted, "decrypt with private key path");
+    assert.equal(decrypted.stdout, plaintext);
+  } finally {
+    fs.rmSync(tmpDir, {recursive: true, force: true});
+  }
+});
+
 test("rejects tampered ciphertext with an HMAC failure", async () => {
   await withAgent(async ({tmpDir, env}) => {
     const alpha = createKey(tmpDir, "alpha@test");

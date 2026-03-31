@@ -10,14 +10,13 @@ Usage:
   $0 -decrypt [key]   < encrypted > plaintext
 
 Key can be:
-  - path to a public key file
+  - path to a key file
   - key comment (e.g. "user@host")
   - SHA256 fingerprint
   - MD5 fingerprint
   - omitted -> first key from ssh-agent
 
 Notes:
-  - Uses ssh-agent via ssh-keygen -Y sign
   - Encryption: AES-256-CBC + HMAC-SHA256
   - Format:
       ssh-agent-crypt:v1:<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
@@ -32,6 +31,7 @@ fail() {
 
 MODE=encrypt
 KEY=
+KEY_FILE=
 
 case "${1:-}" in
   -decrypt)
@@ -46,16 +46,26 @@ case "${1:-}" in
     ;;
 esac
 
+if [ -n "$KEY" ] && [ -f "$KEY" ]; then
+  IFS= read -r first_line < "$KEY" || true
+  case "$first_line" in
+    ssh-*|ecdsa-sha2-*|sk-ssh-*|sk-ecdsa-*) ;;&
+    *) KEY_FILE="$KEY" ;;&
+  esac
+fi
+
 get_agent_keys() {
   ssh-add -L 2>/dev/null || true
 }
 
 resolve_key() {
   local input="$KEY" lookup keys line sha256 md5
-  keys=$(get_agent_keys)
 
-  [ -n "$keys" ] || fail "No keys in ssh-agent"
+  [ -n "$KEY_FILE" ] && return
   [ -n "$input" ] && [ -f "$input" ] && { cat "$input"; return; }
+
+  keys=$(get_agent_keys)
+  [ -n "$keys" ] || fail "No keys in ssh-agent"
   [ -z "$input" ] && { printf '%s\n' "$keys" | head -n1; return; }
 
   lookup=${input#MD5:}
@@ -72,7 +82,6 @@ resolve_key() {
 
   fail "Key not found: $input"
 }
-
 check_algo() {
   local algo
   algo=$(printf '%s\n' "$1" | awk '{print $1}')
@@ -85,14 +94,17 @@ check_algo() {
 }
 
 derive_keys() {
-  local material
+  local material source
 
+  source="from ssh-agent"
+  [ -n "$KEY_FILE" ] && source="from key file: $KEY_FILE"
   material=$(
-    printf '%s' "$1" |
-      ssh-keygen -Y sign -f <(printf '%s\n' "$2") -n file 2>/dev/null |
-      openssl dgst -sha512 -hex -r |
-      awk '{print $1}'
-  ) || fail "Unable to derive key material from ssh-agent"
+    if [ -n "$KEY_FILE" ]; then
+      printf '%s' "$1" | ssh-keygen -Y sign -f "$KEY_FILE" -n file 2>/dev/null
+    else
+      printf '%s' "$1" | ssh-keygen -Y sign -f <(printf '%s\n' "$2") -n file 2>/dev/null
+    fi | openssl dgst -sha512 -hex -r | awk '{print $1}'
+  ) || fail "Unable to derive key material $source"
 
   printf '%s %s\n' \
     "$(printf 'enc:%s' "$material" | openssl dgst -sha256 -hex -r | awk '{print $1}')" \
@@ -145,7 +157,7 @@ decrypt() {
 }
 
 pubkey=$(resolve_key)
-check_algo "$pubkey"
+[ -n "$KEY_FILE" ] || check_algo "$pubkey"
 
 case "$MODE" in
   encrypt) encrypt "$pubkey" ;;
