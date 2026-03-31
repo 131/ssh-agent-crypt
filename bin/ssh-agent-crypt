@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FORMAT_PREFIX="ssh-agent-crypt:v1:"
+
+usage() {
+  cat <<USAGE
+Usage:
+  $0 [key]            < plaintext > encrypted
+  $0 -decrypt [key]   < encrypted > plaintext
+
+Key can be:
+  - path to a public key file
+  - key comment (e.g. "user@host")
+  - SHA256 fingerprint
+  - MD5 fingerprint
+  - omitted -> first key from ssh-agent
+
+Notes:
+  - Uses ssh-agent via ssh-keygen -Y sign
+  - Encryption: AES-256-CBC + HMAC-SHA256
+  - Format:
+      ssh-agent-crypt:v1:<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
+USAGE
+  exit 1
+}
+
+fail() {
+  echo "$*" >&2
+  exit 1
+}
+
+MODE=encrypt
+KEY=
+
+case "${1:-}" in
+  -decrypt)
+    MODE=decrypt
+    KEY="${2:-}"
+    ;;
+  -*)
+    usage
+    ;;
+  *)
+    KEY="${1:-}"
+    ;;
+esac
+
+get_agent_keys() {
+  ssh-add -L 2>/dev/null || true
+}
+
+resolve_key() {
+  local input="$KEY" lookup keys line sha256 md5
+  keys=$(get_agent_keys)
+
+  [ -n "$keys" ] || fail "No keys in ssh-agent"
+  [ -n "$input" ] && [ -f "$input" ] && { cat "$input"; return; }
+  [ -z "$input" ] && { printf '%s\n' "$keys" | head -n1; return; }
+
+  lookup=${input#MD5:}
+  lookup=${lookup//:/}
+
+  while IFS= read -r line; do
+    [[ "$line" = *" $input" ]] && { printf '%s\n' "$line"; return; }
+    sha256=$(printf '%s\n' "$line" | ssh-keygen -lf /dev/stdin | awk '{print $2}')
+    md5=$(printf '%s\n' "$line" | ssh-keygen -E md5 -lf /dev/stdin | awk '{print $2}')
+    [ "$sha256" = "$input" ] || [ "$md5" = "$input" ] || [ "${md5//:/}" = "MD5$lookup" ] || continue
+    printf '%s\n' "$line"
+    return
+  done <<< "$keys"
+
+  fail "Key not found: $input"
+}
+
+check_algo() {
+  local algo
+  algo=$(printf '%s\n' "$1" | awk '{print $1}')
+
+  case "$algo" in
+    ssh-rsa|rsa-sha2-256|rsa-sha2-512|ssh-ed25519) ;;
+    ecdsa-sha2-*) fail "Unsupported key type: $algo (ECDSA signatures are not stable here)" ;;
+    *) fail "Unsupported key type: $algo" ;;
+  esac
+}
+
+derive_keys() {
+  local material
+
+  material=$(
+    printf '%s' "$1" |
+      ssh-keygen -Y sign -f <(printf '%s\n' "$2") -n file 2>/dev/null |
+      openssl dgst -sha512 -hex -r |
+      awk '{print $1}'
+  ) || fail "Unable to derive key material from ssh-agent"
+
+  printf '%s %s\n' \
+    "$(printf 'enc:%s' "$material" | openssl dgst -sha256 -hex -r | awk '{print $1}')" \
+    "$(printf 'mac:%s' "$material" | openssl dgst -sha256 -hex -r | awk '{print $1}')"
+}
+
+encrypt() {
+  local salt_b64 iv_hex enc_key mac_key ciphertext_b64 mac
+
+  salt_b64=$(openssl rand -base64 32 | tr -d '\n')
+  iv_hex=$(openssl rand -hex 16 | tr -d '\n')
+  read -r enc_key mac_key < <(derive_keys "$salt_b64" "$1")
+
+  ciphertext_b64=$(openssl enc -aes-256-cbc -K "$enc_key" -iv "$iv_hex" -nosalt -base64 -A)
+  mac=$(printf '%s.%s.%s' "$salt_b64" "$iv_hex" "$ciphertext_b64" |
+    openssl dgst -sha256 -mac HMAC -macopt "hexkey:$mac_key" -hex -r |
+    awk '{print $1}')
+
+  printf '%s%s.%s.%s.%s\n' "$FORMAT_PREFIX" "$salt_b64" "$iv_hex" "$ciphertext_b64" "$mac"
+}
+
+decrypt() {
+  local line rest salt_b64 iv_hex ciphertext_b64 mac enc_key mac_key expected_mac
+
+  read -r line || fail "Missing payload"
+  case "$line" in
+    "$FORMAT_PREFIX"*) ;;
+    *) fail "Unsupported format header" ;;
+  esac
+
+  rest=${line#"$FORMAT_PREFIX"}
+  salt_b64=${rest%%.*}
+  rest=${rest#*.}
+  [ "$rest" != "$salt_b64" ] || fail "Missing IV"
+  iv_hex=${rest%%.*}
+  rest=${rest#*.}
+  [ "$rest" != "$iv_hex" ] || fail "Missing ciphertext"
+  ciphertext_b64=${rest%.*}
+  mac=${rest##*.}
+  [ "$ciphertext_b64" != "$rest" ] || fail "Missing MAC"
+
+  read -r enc_key mac_key < <(derive_keys "$salt_b64" "$1")
+  expected_mac=$(printf '%s.%s.%s' "$salt_b64" "$iv_hex" "$ciphertext_b64" |
+    openssl dgst -sha256 -mac HMAC -macopt "hexkey:$mac_key" -hex -r |
+    awk '{print $1}')
+  [ "$expected_mac" = "$mac" ] || fail "Authentication failed"
+
+  printf '%s' "$ciphertext_b64" |
+    openssl enc -d -aes-256-cbc -K "$enc_key" -iv "$iv_hex" -nosalt -base64 -A
+}
+
+pubkey=$(resolve_key)
+check_algo "$pubkey"
+
+case "$MODE" in
+  encrypt) encrypt "$pubkey" ;;
+  decrypt) decrypt "$pubkey" ;;
+esac

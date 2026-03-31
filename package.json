@@ -1,0 +1,35 @@
+{
+  "name": "ssh-agent-crypt",
+  "version": "1.0.0",
+  "description": "Seal/unseal data using your ssh-agent. No private key access. No key management.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "bin": {
+    "ssh-agent-crypt": "./bin/ssh-agent-crypt"
+  },
+  "files": [
+    "bin/ssh-agent-crypt",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/131/ssh-agent-crypt.git"
+  },
+  "keywords": [
+    "ssh-agent",
+    "sign",
+    "crypto",
+    "bash"
+  ],
+  "author": "Francois Leurent <131.code@leurent.email>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/131/ssh-agent-crypt/issues"
+  },
+  "homepage": "https://github.com/131/ssh-agent-crypt#readme",
+  "dependencies": {},
+  "devDependencies": {
+    "ssh-agent-js": "^2.0.4"
+  }
+}
