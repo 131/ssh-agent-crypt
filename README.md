@@ -38,7 +38,8 @@ ssh-agent-crypt SHA256:abc123... < secret.txt > secret.enc
 ssh-agent-crypt MD5:aa:bb:cc:dd:... < secret.txt > secret.enc
 ```
 
-You can also use `ssh-agent-crypt` with a direct private key file, with no need for an agent running:
+You can also use a direct private key file, with no need for an agent running.
+Supported key algorithms still apply.
 
 ```bash
 ssh-agent-crypt ~/.ssh/id_ed25519 < secret.txt > secret.enc
@@ -57,11 +58,12 @@ The output is one line:
 ssh-agent-crypt:v1:<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
 ```
 
-## Supported Keys
+## Supported Key Algorithms
 
 - EdDSA (`ssh-ed25519`)
 - RSA (`ssh-rsa`, `rsa-sha2-256`, `rsa-sha2-512`)
 
+ECDSA is not supported.
 
 ## Requirements
 

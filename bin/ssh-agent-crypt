@@ -82,6 +82,7 @@ resolve_key() {
 
   fail "Key not found: $input"
 }
+
 check_algo() {
   local algo
   algo=$(printf '%s\n' "$1" | awk '{print $1}')
