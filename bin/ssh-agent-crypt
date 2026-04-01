@@ -103,14 +103,18 @@ derive_keys() {
       printf '%s' "$1" | ssh-keygen -Y sign -f "$KEY_FILE" -n file 2>/dev/null
     else
       printf '%s' "$1" | ssh-keygen -Y sign -f <(printf '%s\n' "$2") -n file 2>/dev/null
-    fi | openssl dgst -sha512 -hex -r | awk '{print $1}'
+    fi |
+      awk '/BEGIN SSH SIGNATURE/{f=1;next}/END SSH SIGNATURE/{f=0}f' |
+      tr -d '\n' |
+      openssl base64 -d -A |
+      openssl dgst -sha512 -hex -r |
+      awk '{print $1}'
   ) || fail "Unable to derive key material $source"
 
   printf '%s %s\n' \
     "$(printf 'enc:%s' "$material" | openssl dgst -sha256 -hex -r | awk '{print $1}')" \
     "$(printf 'mac:%s' "$material" | openssl dgst -sha256 -hex -r | awk '{print $1}')"
 }
-
 encrypt() {
   local salt_b64 iv_hex enc_key mac_key ciphertext_b64 mac
 
