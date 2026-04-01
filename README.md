@@ -59,10 +59,9 @@ ssh-agent-crypt:v1:<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
 
 ## Supported Keys
 
-- `ssh-ed25519`
+- EdDSA (`ssh-ed25519`)
 - RSA (`ssh-rsa`, `rsa-sha2-256`, `rsa-sha2-512`)
 
-ECDSA is rejected by design: the signature output is not reproducible enough for this derivation scheme.
 
 ## Requirements
 
