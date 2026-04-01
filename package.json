@@ -1,6 +1,6 @@
 {
   "name": "ssh-agent-crypt",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Seal/unseal data using your ssh-agent. No private key access. No key management.",
   "scripts": {
     "test": "node --test"
