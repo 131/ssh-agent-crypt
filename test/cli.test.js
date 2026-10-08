@@ -104,7 +104,7 @@ test("round-trips with the first ssh-agent identity", async () => {
 
     const lines = encrypted.stdout.trimEnd().split("\n");
     assert.equal(lines.length, 1);
-    assert.match(lines[0], /^ssh-agent-crypt:v1:[A-Za-z0-9+/=]+\.[0-9a-f]+\.[A-Za-z0-9+/=]+\.[0-9a-f]+$/);
+    assert.match(lines[0], /^ssh-agent-crypt:v2:SHA256:[A-Za-z0-9+/]{43}\.[A-Za-z0-9+/=]+\.[0-9a-f]+\.[A-Za-z0-9+/=]+\.[0-9a-f]+$/);
 
     const decrypted = run("bash", [CLI_PATH, "-decrypt"], {env, input: encrypted.stdout});
     assertSuccess(decrypted, "decrypt default key");
@@ -224,7 +224,7 @@ test("Node API interoperates with the shipped CLI", async () => {
     addKey(env, alpha.privateKey);
     const plaintext = "node API\nwithout a trailing newline";
     const armored = await encrypt(plaintext, "node@test", {env});
-    assert.match(armored, /^ssh-agent-crypt:v1:/);
+    assert.match(armored, /^ssh-agent-crypt:v2:/);
     assert.equal(await decrypt(armored, "node@test", {env}), plaintext);
     const decrypted = run("bash", [CLI_PATH, "-decrypt", "node@test"], {env, input: armored});
     assertSuccess(decrypted, "CLI decrypts Node armor");
@@ -297,7 +297,7 @@ test('JS rejects ECDSA, missing agents and malformed armor', async () => {
   });
   await assert.rejects(() => encrypt('secret', undefined, {env: {...process.env, SSH_AUTH_SOCK: ''}}));
   await assert.rejects(() => decrypt('plaintext'), /Unsupported format header/);
-  await assert.rejects(() => decrypt('ssh-agent-crypt:v1:missing.parts'), /Invalid payload/);
+  await assert.rejects(() => decrypt('ssh-agent-crypt:v2:missing.parts'), /Invalid key fingerprint/);
 });
 
 
@@ -309,5 +309,146 @@ test('JS encryption and decryption work with no executables on PATH', async () =
     const options = {env: {...env, PATH: tmpDir}};
     const armor = await encrypt('no subprocess', undefined, options);
     assert.equal(await decrypt(armor, undefined, options), 'no subprocess');
+  });
+});
+
+for(const type of ['ed25519', 'rsa']) {
+  test(`v2 selects the embedded fingerprint after agent key reordering (${type})`, async () => {
+    const {encrypt, decrypt} = require('..');
+    await withAgent(async ({tmpDir, env}) => {
+      const alpha = createKey(tmpDir, 'alpha@test');
+      const beta = createKey(tmpDir, `beta-${type}@test`, type);
+      addKey(env, beta.privateKey);
+      addKey(env, alpha.privateKey);
+      const jsArmor = await encrypt('from JS', undefined, {env});
+      const bashArmor = run('bash', [CLI_PATH], {env, input: 'from Bash'});
+      assertSuccess(bashArmor, 'Bash encrypt');
+      const fingerprint = run('ssh-keygen', ['-lf', beta.publicKey]).stdout.split(/\s+/)[1];
+      assert.ok(jsArmor.startsWith(`ssh-agent-crypt:v2:${fingerprint}.`));
+      assert.ok(bashArmor.stdout.startsWith(`ssh-agent-crypt:v2:${fingerprint}.`));
+      assertSuccess(run('ssh-add', ['-D'], {env}), 'remove identities');
+      addKey(env, alpha.privateKey);
+      addKey(env, beta.privateKey);
+      assert.equal(await decrypt(bashArmor.stdout, undefined, {env}), 'from Bash');
+      const decoded = run('bash', [CLI_PATH, '-decrypt'], {env, input: jsArmor});
+      assertSuccess(decoded, 'Bash decrypt reordered keys');
+      assert.equal(decoded.stdout, 'from JS');
+      assert.equal(await decrypt(jsArmor, undefined, {env}), 'from JS');
+      // The fingerprint must be authenticated even with an explicit selector.
+      const other = run('ssh-keygen', ['-lf', alpha.publicKey]).stdout.split(/\s+/)[1];
+      const tampered = jsArmor.replace(fingerprint, other);
+      await assert.rejects(() => decrypt(tampered, beta.comment, {env}), /Authentication failed/);
+      const rejected = run('bash', [CLI_PATH, '-decrypt', beta.comment], {env, input: tampered});
+      assert.notEqual(rejected.status, 0);
+      assert.match(rejected.stderr, /Authentication failed/);
+      assertSuccess(run('ssh-add', ['-d', beta.privateKey], {env}), 'remove selected key');
+      await assert.rejects(() => decrypt(jsArmor, undefined, {env}), /Key not found/);
+      const missing = run('bash', [CLI_PATH, '-decrypt'], {env, input: jsArmor});
+      assert.notEqual(missing.status, 0);
+      assert.match(missing.stderr, /Key not found/);
+    });
+  });
+}
+
+for(const type of ['ed25519', 'rsa']) {
+  test(`v1 remains readable without changing the v2 encryption flow (${type})`, async () => {
+    const {decrypt} = require('..');
+    await withAgent(async ({tmpDir, env}) => {
+      const key = createKey(tmpDir, 'legacy@test', type);
+      addKey(env, key.privateKey);
+      const encrypted = run('bash', [CLI_PATH], {env, input: 'legacy token'});
+      assertSuccess(encrypted, 'Bash encryption');
+      const [, salt, iv, ciphertext] = encrypted.stdout.trim().slice('ssh-agent-crypt:v2:'.length).split('.');
+      const signed = run('ssh-keygen', ['-Y', 'sign', '-f', key.privateKey, '-n', 'file'], {env, input: salt});
+      assertSuccess(signed, 'sign legacy salt');
+      const {createHash, createHmac} = require('crypto');
+      const signature = signed.stdout.split('\n').filter(line => line && !line.startsWith('-----')).join('');
+      const material = createHash('sha512').update(Buffer.from(signature, 'base64')).digest('hex');
+      const macKey = createHash('sha256').update('mac:' + material).digest();
+      const payload = `${salt}.${iv}.${ciphertext}`;
+      const mac = createHmac('sha256', macKey).update(payload).digest('hex');
+      const armored = {stdout: `ssh-agent-crypt:v1:${payload}.${mac}\n`};
+      assert.match(armored.stdout, /^ssh-agent-crypt:v1:/);
+      assert.equal(await decrypt(armored.stdout, undefined, {env}), 'legacy token');
+      assert.equal(await decrypt(armored.stdout, key.comment, {env}), 'legacy token');
+      const decoded = run('bash', [CLI_PATH, '-decrypt'], {env, input: armored.stdout});
+      assertSuccess(decoded, 'Bash reads original v1');
+      assert.equal(decoded.stdout, 'legacy token');
+    });
+  });
+}
+
+test('Bash signing failures abort encryption and decryption without output', async () => {
+  await withAgent(async ({tmpDir, env}) => {
+    const key = createKey(tmpDir, 'failure@test');
+    addKey(env, key.privateKey);
+    const armored = run('bash', [CLI_PATH], {env, input: 'secret'});
+    assertSuccess(armored, 'prepare ciphertext');
+    const realKeygen = run('which', ['ssh-keygen']).stdout.trim();
+    const mockDirectory = path.join(tmpDir, 'mock-bin');
+    fs.mkdirSync(mockDirectory);
+    fs.writeFileSync(path.join(mockDirectory, 'ssh-keygen'), `#!/usr/bin/env bash
+if [ "$1" = '-Y' ]; then
+  echo 'Agent refused signature' >&2
+  exit 1
+fi
+exec '${realKeygen}' "$@"
+`, {mode: 0o700});
+    const failing = {...env, PATH: `${mockDirectory}:${env.PATH}`};
+    for(const [args, input] of [[[], 'secret'], [['-decrypt'], armored.stdout]]) {
+      const result = run('bash', [CLI_PATH, ...args], {env: failing, input});
+      assert.notEqual(result.status, 0);
+      assert.equal(result.stdout, '');
+      assert.match(result.stderr, /Unable to derive/);
+    }
+  });
+});
+
+test('Bash unavailable agent fails without emitting ciphertext', () => {
+  const result = run('bash', [CLI_PATH], {
+    env: {...process.env, SSH_AUTH_SOCK: '/nonexistent/agent.sock'}, input: 'secret',
+  });
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /Unable to list ssh-agent keys/);
+});
+
+test('Bash encryption waits for upstream EOF before contacting the agent', async () => {
+  await withAgent(async ({tmpDir, env}) => {
+    const key = createKey(tmpDir, 'pipeline@test');
+    addKey(env, key.privateKey);
+    const realAdd = run('which', ['ssh-add']).stdout.trim();
+    const mockDirectory = path.join(tmpDir, 'mock-bin');
+    const marker = path.join(tmpDir, 'agent-contacted');
+    fs.mkdirSync(mockDirectory);
+    fs.writeFileSync(path.join(mockDirectory, 'ssh-add'), `#!/usr/bin/env bash
+: > "$MARKER"
+exec '${realAdd}' "$@"
+`, {mode: 0o700});
+    const result = run('bash', ['-o', 'pipefail', '-c', `
+      { sleep 0.1; test ! -f "$MARKER" || exit 1; printf 'pipeline input\\n\\n'; } |
+      bash "$CLI"
+    `], {env: {...env, PATH: `${mockDirectory}:${env.PATH}`, MARKER: marker, CLI: CLI_PATH}});
+    assertSuccess(result, 'wait for producer');
+    assert.ok(fs.existsSync(marker));
+    const {decrypt} = require('..');
+    assert.equal(await decrypt(result.stdout, undefined, {env}), 'pipeline input\n\n');
+  });
+});
+
+test('Bash decrypt/encrypt pipeline preserves binary input and trailing newlines', async () => {
+  await withAgent(async ({tmpDir, env}) => {
+    const key = createKey(tmpDir, 'binary@test');
+    addKey(env, key.privateKey);
+    const input = Buffer.from([0, 255, 128, 65, 10, 10]);
+    const armored = run('bash', [CLI_PATH], {env, input});
+    assertSuccess(armored, 'encrypt binary');
+    const pipeline = run('bash', ['-o', 'pipefail', '-c', 'bash "$CLI" -decrypt | bash "$CLI"'], {
+      env: {...env, CLI: CLI_PATH}, input: armored.stdout,
+    });
+    assertSuccess(pipeline, 'rearmor binary');
+    const decoded = run('bash', [CLI_PATH, '-decrypt'], {env, input: pipeline.stdout, encoding: null});
+    assert.equal(decoded.status, 0);
+    assert.deepEqual(decoded.stdout, input);
   });
 });

@@ -6,7 +6,11 @@ const {utils: {parseKey}} = require('ssh2');
 const {createAgent} = require('ssh2/lib/agent');
 const {randomBytes, createHash, createHmac, createCipheriv, createDecipheriv, timingSafeEqual} = require('crypto');
 
-const PREFIX = 'ssh-agent-crypt:v1:';
+const PREFIX = 'ssh-agent-crypt:v2:';
+
+function fingerprint(key) {
+  return 'SHA256:' + createHash('sha256').update(key.getPublicSSH()).digest('base64').replace(/=+$/, '');
+}
 
 async function resolveKey(selector, agent) {
   if(selector && fs.existsSync(selector)) {
@@ -24,7 +28,7 @@ async function resolveKey(selector, agent) {
     return keys[0];
   for(const key of keys) {
     const blob = key.getPublicSSH();
-    const sha256 = 'SHA256:' + createHash('sha256').update(blob).digest('base64').replace(/=+$/, '');
+    const sha256 = fingerprint(key);
     const md5 = createHash('md5').update(blob).digest('hex');
     if(key.comment === selector || sha256 === selector || md5 === selector.replace(/^MD5:/, '').replace(/:/g, ''))
       return key;
@@ -65,6 +69,7 @@ async function deriveKeys(salt, selector, {env = process.env} = {}) {
   ]);
   const material = createHash('sha512').update(blob).digest('hex');
   return {
+    fingerprint: fingerprint(key),
     enc: createHash('sha256').update('enc:' + material).digest(),
     mac: createHash('sha256').update('mac:' + material).digest(),
   };
@@ -76,21 +81,33 @@ exports.encrypt = async function(input, key, options) {
   const keys = await deriveKeys(salt, key, options);
   const cipher = createCipheriv('aes-256-cbc', keys.enc, iv);
   const ciphertext = Buffer.concat([cipher.update(input), cipher.final()]).toString('base64');
-  const payload = `${salt}.${iv.toString('hex')}.${ciphertext}`;
+  const payload = `${keys.fingerprint}.${salt}.${iv.toString('hex')}.${ciphertext}`;
   const mac = createHmac('sha256', keys.mac).update(payload).digest('hex');
   return `${PREFIX}${payload}.${mac}\n`;
 };
 
 exports.decrypt = async function(input, key, options) {
   const line = input.toString().split('\n')[0];
-  if(!line.startsWith(PREFIX))
+  let payload, parts, selector = key;
+  if(line.startsWith(PREFIX)) {
+    payload = line.slice(PREFIX.length);
+    parts = payload.split('.');
+    const fingerprint = parts.shift();
+    if(!/^SHA256:[A-Za-z0-9+/]{43}$/.test(fingerprint))
+      throw new Error('Invalid key fingerprint');
+    selector = key || fingerprint;
+  } else if(line.startsWith('ssh-agent-crypt:v1:')) {
+    payload = line.slice('ssh-agent-crypt:v1:'.length);
+    parts = payload.split('.');
+  } else {
     throw new Error('Unsupported format header');
-  const parts = line.slice(PREFIX.length).split('.');
+  }
   if(parts.length !== 4)
     throw new Error('Invalid payload');
   const [salt, iv, ciphertext, mac] = parts;
-  const keys = await deriveKeys(salt, key, options);
-  const expected = createHmac('sha256', keys.mac).update(`${salt}.${iv}.${ciphertext}`).digest();
+  const keys = await deriveKeys(salt, selector, options);
+  const authenticated = payload.slice(0, payload.lastIndexOf('.'));
+  const expected = createHmac('sha256', keys.mac).update(authenticated).digest();
   const actual = Buffer.from(mac, 'hex');
   if(actual.length !== expected.length || !timingSafeEqual(actual, expected))
     throw new Error('Authentication failed');

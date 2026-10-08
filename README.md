@@ -23,7 +23,7 @@ Encrypt with the first key loaded in your agent:
 cat secret.txt | ssh-agent-crypt > secret.enc
 ```
 
-Decrypt with the same key:
+Decrypt using the fingerprint embedded in the payload:
 
 ```bash
 cat secret.enc | ssh-agent-crypt -decrypt > secret.txt
@@ -55,8 +55,13 @@ ssh-agent-crypt ~/.ssh/id_ed25519 < secret.txt > secret.enc
 The output is one line:
 
 ```text
-ssh-agent-crypt:v1:<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
+ssh-agent-crypt:v2:<fingerprint>.<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
 ```
+
+The SHA256 fingerprint selects the signing key automatically, regardless of
+agent key order, and is authenticated by the HMAC. An explicit key selector
+still overrides automatic selection. Legacy v1 payloads remain readable using
+the previous first-key/explicit-selector behavior.
 
 ## Supported Key Algorithms
 
@@ -73,7 +78,7 @@ ECDSA is not supported.
 
 ## Tests
 
-Bash and JavaScript are both canonical implementations of the same v1 format.
+Bash and JavaScript are both canonical implementations of the same v2 format.
 Tests verify encryption and decryption in both directions. The test harness
 uses the local `ssh-agent-js` dev dependency.
 
