@@ -9,6 +9,7 @@
     "ssh-agent-crypt": "./bin/ssh-agent-crypt"
   },
   "files": [
+    "index.js",
     "bin/ssh-agent-crypt",
     "README.md"
   ],
@@ -28,8 +29,14 @@
     "url": "https://github.com/131/ssh-agent-crypt/issues"
   },
   "homepage": "https://github.com/131/ssh-agent-crypt#readme",
-  "dependencies": {},
+  "dependencies": {
+    "ssh2": "^1.16.0"
+  },
   "devDependencies": {
     "ssh-agent-js": "^2.0.4"
+  },
+  "main": "index.js",
+  "engines": {
+    "node": ">=20"
   }
 }

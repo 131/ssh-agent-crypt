@@ -215,3 +215,99 @@ test("rejects tampered ciphertext with an HMAC failure", async () => {
     assert.match(decrypted.stderr, /Authentication failed/);
   });
 });
+
+
+test("Node API interoperates with the shipped CLI", async () => {
+  const {encrypt, decrypt} = require("..");
+  await withAgent(async ({tmpDir, env}) => {
+    const alpha = createKey(tmpDir, "node@test");
+    addKey(env, alpha.privateKey);
+    const plaintext = "node API\nwithout a trailing newline";
+    const armored = await encrypt(plaintext, "node@test", {env});
+    assert.match(armored, /^ssh-agent-crypt:v1:/);
+    assert.equal(await decrypt(armored, "node@test", {env}), plaintext);
+    const decrypted = run("bash", [CLI_PATH, "-decrypt", "node@test"], {env, input: armored});
+    assertSuccess(decrypted, "CLI decrypts Node armor");
+    assert.equal(decrypted.stdout, plaintext);
+    const encrypted = run("bash", [CLI_PATH, "node@test"], {env, input: plaintext});
+    assertSuccess(encrypted, "CLI encrypts for Node");
+    assert.equal(await decrypt(encrypted.stdout, "node@test", {env}), plaintext);
+    await assert.rejects(() => decrypt(armored.replace(/.$/m, "x"), "node@test", {env}), /Authentication failed/);
+    await assert.rejects(() => encrypt(plaintext, "missing@test", {env}), /Key not found/);
+  });
+});
+
+for(const type of ['ed25519', 'rsa']) {
+  test(`canonical JS/Bash cross-decryption for ${type} and all key selectors`, async () => {
+    const {encrypt, decrypt} = require('..');
+    await withAgent(async ({tmpDir, env}) => {
+      const alpha = createKey(tmpDir, 'alpha@test');
+      const selected = createKey(tmpDir, `selected-${type}@test`, type);
+      addKey(env, alpha.privateKey);
+      addKey(env, selected.privateKey);
+      const sha256 = run('ssh-keygen', ['-lf', selected.publicKey]).stdout.split(/\s+/)[1];
+      const md5 = run('ssh-keygen', ['-E', 'md5', '-lf', selected.publicKey]).stdout.split(/\s+/)[1];
+      const selectors = [selected.comment, selected.publicKey, sha256, md5, md5.replace(/:/g, '').slice(3)];
+      for(const selector of selectors) {
+        const plaintext = `Unicode: coucou bibou 🐻\n${selector}`;
+        const armor = await encrypt(plaintext, selector, {env});
+        const bash = run('bash', [CLI_PATH, '-decrypt', selected.comment], {env, input: armor});
+        assertSuccess(bash, 'Bash decrypts JS ' + selector);
+        assert.equal(bash.stdout, plaintext);
+        const encrypted = run('bash', [CLI_PATH, selected.comment], {env, input: plaintext});
+        assertSuccess(encrypted, 'Bash encrypts');
+        assert.equal(await decrypt(encrypted.stdout, selector, {env}), plaintext);
+      }
+      const empty = await encrypt('', undefined, {env});
+      assert.equal(await decrypt(empty, undefined, {env}), '');
+      const bashEmpty = run('bash', [CLI_PATH, '-decrypt'], {env, input: empty});
+      assertSuccess(bashEmpty, 'empty ciphertext');
+      assert.equal(bashEmpty.stdout, '');
+      const wrong = await encrypt('secret', alpha.comment, {env});
+      await assert.rejects(() => decrypt(wrong, selected.comment, {env}), /Authentication failed/);
+    });
+  });
+}
+
+test('JS private key mode interoperates without an agent', async () => {
+  const {encrypt, decrypt} = require('..');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-agent-crypt-node-'));
+  const env = {...process.env, SSH_AUTH_SOCK: ''};
+  try {
+    const key = createKey(tmpDir, 'private@test');
+    const armor = await encrypt('private key', key.privateKey, {env});
+    const bash = run('bash', [CLI_PATH, '-decrypt', key.privateKey], {env, input: armor});
+    assertSuccess(bash, 'private key Bash decrypt');
+    assert.equal(bash.stdout, 'private key');
+    const encrypted = run('bash', [CLI_PATH, key.privateKey], {env, input: 'reverse'});
+    assertSuccess(encrypted, 'private key Bash encrypt');
+    assert.equal(await decrypt(encrypted.stdout, key.privateKey, {env}), 'reverse');
+  } finally {
+    fs.rmSync(tmpDir, {recursive: true, force: true});
+  }
+});
+
+test('JS rejects ECDSA, missing agents and malformed armor', async () => {
+  const {encrypt, decrypt} = require('..');
+  await withAgent(async ({tmpDir, env}) => {
+    const key = createKey(tmpDir, 'ecdsa@test', 'ecdsa');
+    addKey(env, key.privateKey);
+    await assert.rejects(() => encrypt('secret', undefined, {env}), /Unsupported key type/);
+    await assert.rejects(() => encrypt('secret', key.publicKey, {env}), /Unsupported key type/);
+  });
+  await assert.rejects(() => encrypt('secret', undefined, {env: {...process.env, SSH_AUTH_SOCK: ''}}));
+  await assert.rejects(() => decrypt('plaintext'), /Unsupported format header/);
+  await assert.rejects(() => decrypt('ssh-agent-crypt:v1:missing.parts'), /Invalid payload/);
+});
+
+
+test('JS encryption and decryption work with no executables on PATH', async () => {
+  const {encrypt, decrypt} = require('..');
+  await withAgent(async ({tmpDir, env}) => {
+    const key = createKey(tmpDir, 'pure-js@test');
+    addKey(env, key.privateKey);
+    const options = {env: {...env, PATH: tmpDir}};
+    const armor = await encrypt('no subprocess', undefined, options);
+    assert.equal(await decrypt(armor, undefined, options), 'no subprocess');
+  });
+});

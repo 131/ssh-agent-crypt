@@ -73,7 +73,9 @@ ECDSA is not supported.
 
 ## Tests
 
-The shipped tool is pure bash. The test harness uses the local `ssh-agent-js` dev dependency.
+Bash and JavaScript are both canonical implementations of the same v1 format.
+Tests verify encryption and decryption in both directions. The test harness
+uses the local `ssh-agent-js` dev dependency.
 
 ```bash
 npm test
@@ -82,3 +84,18 @@ npm test
 ## Credits
 
 - [Francois Leurent/131](https://github.com/131)
+
+## Node API
+
+The asynchronous JavaScript API implements the same flow as Bash using Node
+crypto and `ssh2` for agent access, key parsing and SSH signatures.
+No subprocesses, Bash or OpenSSL:
+
+```js
+const {encrypt, decrypt} = require('ssh-agent-crypt');
+const armored = await encrypt('secret');
+const plaintext = await decrypt(armored);
+```
+
+Both functions accept an optional key selector and an environment override:
+`encrypt(input, key, {env})`. Both return promises with UTF-8 output; failures reject.
