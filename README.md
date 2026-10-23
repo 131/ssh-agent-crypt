@@ -126,10 +126,7 @@ selection.
 
 Legacy payloads remain readable: v2 (same layout, signed in the generic
 `file` namespace, header not authenticated) and v1 (no fingerprint,
-first-key/explicit-selector behavior). Encryption always produces v3. The
-namespace change means a routine `ssh-keygen -Y sign -n file` signature can
-no longer double as key material for new ciphertexts; re-encrypt v2 data to
-get that property.
+first-key/explicit-selector behavior). Encryption always produces v3.
 
 Since the key material is a signature, whoever can ask your agent to sign can
 also decrypt. Loading the key with `ssh-add -c` makes the agent ask for
@@ -157,13 +154,13 @@ Node module, Go module, agent transport details and the test matrix:
 ## Security audit
 
 Two independent reviews of the design and of the three implementations, each
-scoring Coolness, Robustness and Safety out of 20:
+scoring **Coolness**, Robustness and Safety out of 20:
 [SECURITY_AUDIT_fable-5.1.md](SECURITY_AUDIT_fable-5.1.md) and
 [SECURITY_AUDIT_gpt-6.1-sol.md](SECURITY_AUDIT_gpt-6.1-sol.md).
 
 | Criterion | Codex (Claude Fable 5.1) | Codex (GPT 6.1) |
 | --- | ---: | ---: |
-| Coolness | 16/20 | 18/20 |
+| **Coolness** | **16/20** | **18/20** |
 | Robustness | 16/20 | 16/20 |
 | Safety | 14/20 | 15/20 |
 
