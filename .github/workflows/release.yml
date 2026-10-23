@@ -22,16 +22,10 @@ jobs:
           mkdir -p output
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o output/ssh-agent-crypt-linux-amd64 ./cmd/ssh-agent-crypt
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o output/ssh-agent-crypt-windows-amd64.exe ./cmd/ssh-agent-crypt
-      - name: Sign ssh-agent-crypt-windows-amd64.exe
-        env:
-          SIGNING_SERVER: ${{ secrets.SIGNING_SERVER }}
-        run: |
-          if [ -z "${SIGNING_SERVER:-}" ]; then echo "No signing server defined, binary left unsigned"; exit 0; fi
-          file=output/ssh-agent-crypt-windows-amd64.exe
-          response=$(curl -s -X PUT --data-binary @- -D - -o "$file.signed" "$SIGNING_SERVER" < "$file" | sed 's/\r$//')
-          echo "$response" | grep -qe "HTTP/1.. 200 " || { echo "Could not sign $file"; exit 1; }
-          mv "$file.signed" "$file"
-          echo "$file successfully signed."
+      - uses: 131/gh-actions/sign-binaries@v1
+        with:
+          files: output/*.exe
+          signing-server: ${{ secrets.SIGNING_SERVER }}
       - run: (cd output && sha256sum ssh-agent-crypt-* > SHA256SUMS)
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2
