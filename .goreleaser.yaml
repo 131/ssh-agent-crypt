@@ -13,10 +13,8 @@ builds:
     goarch: [amd64]
     flags: [-trimpath]
     ldflags: [-s -w]
-    # Enable once the SIGNING_SERVER secret exists in the production environment
-    # (release.yml checks out 131/gh-actions into .gh-actions)
-    # hooks:
-    #   post: .gh-actions/sign-binaries/sign {{ .Path }}
+    hooks:
+      post: .gh-actions/sign-binaries/sign {{ .Path }}
 
 archives:
   - formats: [binary]

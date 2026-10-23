@@ -19,16 +19,15 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go vet ./... && go test ./...
-      # Enable once the SIGNING_SERVER secret exists in the production environment
-      # - uses: actions/checkout@v4
-      #   with:
-      #     repository: 131/gh-actions
-      #     ref: v1
-      #     path: .gh-actions
+      - uses: actions/checkout@v4
+        with:
+          repository: 131/gh-actions
+          ref: v1
+          path: .gh-actions
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: '~> v2'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # SIGNING_SERVER: ${{ secrets.SIGNING_SERVER }}
+          SIGNING_SERVER: ${{ secrets.SIGNING_SERVER }}
