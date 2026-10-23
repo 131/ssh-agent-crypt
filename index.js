@@ -6,7 +6,9 @@ const {utils: {parseKey}} = require('ssh2');
 const {createAgent} = require('ssh2/lib/agent');
 const {randomBytes, createHash, createHmac, createCipheriv, createDecipheriv, timingSafeEqual} = require('crypto');
 
-const PREFIX = 'ssh-agent-crypt:v2:';
+const PREFIX = 'ssh-agent-crypt:v3:';
+const NAMESPACE = 'ssh-agent-crypt';
+const LEGACY = {'ssh-agent-crypt:v2:': {namespace: 'file', fingerprint: true}, 'ssh-agent-crypt:v1:': {namespace: 'file', fingerprint: false}};
 
 function fingerprint(key) {
   return 'SHA256:' + createHash('sha256').update(key.getPublicSSH()).digest('base64').replace(/=+$/, '');
@@ -43,14 +45,14 @@ function sshString(value) {
   return Buffer.concat([length, bytes]);
 }
 
-async function deriveKeys(salt, selector, {env = process.env} = {}) {
+async function deriveKeys(namespace, salt, selector, {env = process.env} = {}) {
   const agent = createAgent(env.SSH_AUTH_SOCK || (process.platform === 'win32' ? 'pageant' : ''));
   const key = await resolveKey(selector, agent);
   if(!['ssh-rsa', 'ssh-ed25519'].includes(key.type))
     throw new Error(`Unsupported key type: ${key.type}`);
 
   // Reproduce OpenSSH's SSHSIG envelope, not just the raw agent signature.
-  const fields = [sshString('file'), sshString(''), sshString('sha512')];
+  const fields = [sshString(namespace), sshString(''), sshString('sha512')];
   const message = createHash('sha512').update(salt).digest();
   const data = Buffer.concat([Buffer.from('SSHSIG'), ...fields, sshString(message)]);
   let signature;
@@ -75,42 +77,53 @@ async function deriveKeys(salt, selector, {env = process.env} = {}) {
   };
 }
 
+// A missing key falls back to the environment (same syntax as the CLI
+// argument): SSH_AGENT_CRYPT_KEY, then the vauth identity variables. An
+// embedded fingerprint still wins when decrypting v2/v3 payloads.
+const DEFAULT_KEY_ENV = ['SSH_AGENT_CRYPT_KEY', 'VAUTH_USER_IDENTITY', 'VAUTH_USER_MAIL'];
+const defaultKey = (key, {env = process.env} = {}) => key || DEFAULT_KEY_ENV.map(name => env[name]).find(Boolean);
+
 exports.encrypt = async function(input, key, options) {
+  key = defaultKey(key, options);
   const salt = randomBytes(32).toString('base64');
   const iv = randomBytes(16);
-  const keys = await deriveKeys(salt, key, options);
+  const keys = await deriveKeys(NAMESPACE, salt, key, options);
   const cipher = createCipheriv('aes-256-cbc', keys.enc, iv);
   const ciphertext = Buffer.concat([cipher.update(input), cipher.final()]).toString('base64');
   const payload = `${keys.fingerprint}.${salt}.${iv.toString('hex')}.${ciphertext}`;
-  const mac = createHmac('sha256', keys.mac).update(payload).digest('hex');
+  const mac = createHmac('sha256', keys.mac).update(PREFIX + payload).digest('hex');
   return `${PREFIX}${payload}.${mac}\n`;
 };
 
+// decrypt(input, key, {env}) resolves to the plaintext as a Buffer.
 exports.decrypt = async function(input, key, options) {
-  const line = input.toString().split('\n')[0];
-  let payload, parts, selector = key;
-  if(line.startsWith(PREFIX)) {
-    payload = line.slice(PREFIX.length);
-    parts = payload.split('.');
+  const line = input.toString().split('\n')[0].replace(/\r$/, '');
+  let selector = key, namespace = NAMESPACE, withFingerprint = true, authenticatedPrefix = PREFIX;
+  const prefix = [PREFIX, ...Object.keys(LEGACY)].find(candidate => line.startsWith(candidate));
+  if(!prefix)
+    throw new Error('Unsupported format header');
+  if(LEGACY[prefix])
+    ({namespace, fingerprint: withFingerprint} = LEGACY[prefix]), authenticatedPrefix = '';
+  const payload = line.slice(prefix.length);
+  const parts = payload.split('.');
+  if(withFingerprint) {
     const fingerprint = parts.shift();
     if(!/^SHA256:[A-Za-z0-9+/]{43}$/.test(fingerprint))
       throw new Error('Invalid key fingerprint');
     selector = key || fingerprint;
-  } else if(line.startsWith('ssh-agent-crypt:v1:')) {
-    payload = line.slice('ssh-agent-crypt:v1:'.length);
-    parts = payload.split('.');
-  } else {
-    throw new Error('Unsupported format header');
   }
   if(parts.length !== 4)
     throw new Error('Invalid payload');
+  selector = defaultKey(selector, options);
   const [salt, iv, ciphertext, mac] = parts;
-  const keys = await deriveKeys(salt, selector, options);
-  const authenticated = payload.slice(0, payload.lastIndexOf('.'));
+  if(!/^[0-9a-fA-F]{64}$/.test(mac))
+    throw new Error('Authentication failed');
+  const keys = await deriveKeys(namespace, salt, selector, options);
+  const authenticated = authenticatedPrefix + payload.slice(0, payload.lastIndexOf('.'));
   const expected = createHmac('sha256', keys.mac).update(authenticated).digest();
   const actual = Buffer.from(mac, 'hex');
   if(actual.length !== expected.length || !timingSafeEqual(actual, expected))
     throw new Error('Authentication failed');
   const decipher = createDecipheriv('aes-256-cbc', keys.enc, Buffer.from(iv, 'hex'));
-  return Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64')), decipher.final()]).toString('utf8');
+  return Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64')), decipher.final()]);
 };

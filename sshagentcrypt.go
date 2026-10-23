@@ -1,6 +1,6 @@
 // Package sshagentcrypt seals and unseals data with a key held by the
 // ssh-agent, without private key access. It is the Go implementation of the
-// ssh-agent-crypt v2 format shared with the Bash and Node implementations.
+// ssh-agent-crypt v3 format (with legacy v1/v2 reading) shared with the Bash and Node implementations.
 package sshagentcrypt
 
 import (
@@ -27,20 +27,57 @@ import (
 )
 
 // Prefix is the armor header of the current format.
-const Prefix = "ssh-agent-crypt:v2:"
+const Prefix = "ssh-agent-crypt:v3:"
 
-const legacyPrefix = "ssh-agent-crypt:v1:"
+// Namespace is the SSHSIG namespace signed by the current format. It isolates
+// ssh-agent-crypt signatures from `ssh-keygen -Y sign -n file` ones, so that a
+// routine file signature never doubles as key material.
+const Namespace = "ssh-agent-crypt"
+
+const (
+	legacyPrefixV1    = "ssh-agent-crypt:v1:"
+	legacyPrefixV2    = "ssh-agent-crypt:v2:"
+	legacyNamespaceV1 = "file"
+)
 
 var fingerprintPattern = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]{43}$`)
 
-// Options tune agent access. The zero value reads SSH_AUTH_SOCK from the
-// process environment and uses crypto/rand.
+// DefaultKeyEnv names the environment variable that stands in for an empty
+// selector: same syntax as the CLI argument (file path, comment, SHA256 or
+// MD5 fingerprint). An embedded fingerprint still wins when decrypting.
+const DefaultKeyEnv = "SSH_AGENT_CRYPT_KEY"
+
+// defaultKeyEnv lists the environment fallbacks, in order: DefaultKeyEnv, then
+// the vauth identity variables.
+var defaultKeyEnv = []string{DefaultKeyEnv, "VAUTH_USER_IDENTITY", "VAUTH_USER_MAIL"}
+
+// Options tune agent access. The zero value reads SSH_AUTH_SOCK and
+// SSH_AGENT_CRYPT_KEY from the process environment and uses crypto/rand.
 type Options struct {
 	// AgentSocket is the ssh-agent address: a Unix socket path, or a named
 	// pipe on Windows. Empty means DefaultAgentAddress (SSH_AUTH_SOCK).
 	AgentSocket string
+	// DefaultKey is the selector used when none is given and no embedded
+	// fingerprint applies. Empty means DefaultKeyEnv, then VAUTH_USER_IDENTITY
+	// and VAUTH_USER_MAIL, from the environment.
+	DefaultKey string
 	// Rand is the entropy source for salt and IV; nil means crypto/rand.
 	Rand io.Reader
+}
+
+func (o *Options) defaultKey(selector string) string {
+	if selector != "" {
+		return selector
+	}
+	if o != nil && o.DefaultKey != "" {
+		return o.DefaultKey
+	}
+	for _, name := range defaultKeyEnv {
+		if value := os.Getenv(name); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (o *Options) agentSocket() string {
@@ -63,18 +100,23 @@ type derivedKeys struct {
 	mac         []byte
 }
 
-// signer abstracts an agent-held key or a local private key.
+// signer abstracts an agent-held key or a local private key. Close releases
+// the agent connection, if any.
 type signer interface {
 	PublicKey() ssh.PublicKey
 	Sign(data []byte) (*ssh.Signature, error)
+	Close()
 }
 
 type agentSigner struct {
 	client agent.ExtendedAgent
 	key    ssh.PublicKey
+	close  func()
 }
 
 func (s *agentSigner) PublicKey() ssh.PublicKey { return s.key }
+
+func (s *agentSigner) Close() { s.close() }
 
 func (s *agentSigner) Sign(data []byte) (*ssh.Signature, error) {
 	var flags agent.SignatureFlags
@@ -89,6 +131,8 @@ type localSigner struct {
 }
 
 func (s *localSigner) PublicKey() ssh.PublicKey { return s.signer.PublicKey() }
+
+func (s *localSigner) Close() {}
 
 func (s *localSigner) Sign(data []byte) (*ssh.Signature, error) {
 	if s.signer.PublicKey().Type() == ssh.KeyAlgoRSA {
@@ -134,13 +178,13 @@ func resolveKey(selector string, options *Options) (signer, error) {
 		return nil, errors.New("No keys in ssh-agent")
 	}
 	if selector == "" {
-		return &agentSigner{client, keys[0]}, nil
+		return &agentSigner{client, keys[0], closeAgent}, nil
 	}
 	md5Selector := strings.ReplaceAll(strings.TrimPrefix(selector, "MD5:"), ":", "")
 	for _, key := range keys {
 		md5 := strings.ReplaceAll(ssh.FingerprintLegacyMD5(key), ":", "")
 		if key.Comment == selector || Fingerprint(key) == selector || md5 == md5Selector {
-			return &agentSigner{client, key}, nil
+			return &agentSigner{client, key, closeAgent}, nil
 		}
 	}
 	closeAgent()
@@ -155,6 +199,9 @@ func resolveKeyFile(body []byte, options *Options) (signer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Unsupported key file: %w", err)
 	}
+	if err := checkAlgorithm(public); err != nil {
+		return nil, err
+	}
 	// Public key file: the agent must hold the matching private key.
 	client, closeAgent, err := connectAgent(options)
 	if err != nil {
@@ -167,7 +214,7 @@ func resolveKeyFile(body []byte, options *Options) (signer, error) {
 	}
 	for _, key := range keys {
 		if bytes.Equal(key.Marshal(), public.Marshal()) {
-			return &agentSigner{client, key}, nil
+			return &agentSigner{client, key, closeAgent}, nil
 		}
 	}
 	closeAgent()
@@ -194,19 +241,21 @@ func sshString(value []byte) []byte {
 }
 
 // deriveKeys reproduces the OpenSSH SSHSIG envelope over the salt, as
-// `ssh-keygen -Y sign -n file` would produce, and hashes it into key material.
-func deriveKeys(salt string, selector string, options *Options) (*derivedKeys, error) {
+// `ssh-keygen -Y sign -n <namespace>` would produce, and hashes it into key
+// material.
+func deriveKeys(namespace string, salt string, selector string, options *Options) (*derivedKeys, error) {
 	key, err := resolveKey(selector, options)
 	if err != nil {
 		return nil, err
 	}
+	defer key.Close()
 	public := key.PublicKey()
 	if err := checkAlgorithm(public); err != nil {
 		return nil, err
 	}
 
 	message := sha512.Sum512([]byte(salt))
-	fields := bytes.Join([][]byte{sshString([]byte("file")), sshString(nil), sshString([]byte("sha512"))}, nil)
+	fields := bytes.Join([][]byte{sshString([]byte(namespace)), sshString(nil), sshString([]byte("sha512"))}, nil)
 	data := bytes.Join([][]byte{[]byte("SSHSIG"), fields, sshString(message[:])}, nil)
 
 	signature, err := key.Sign(data)
@@ -245,9 +294,11 @@ func pkcs7Unpad(input []byte, size int) ([]byte, error) {
 }
 
 // Encrypt seals input with the key designated by selector (file path, comment,
-// SHA256 or MD5 fingerprint; empty selects the first agent key). It returns a
-// single armored line terminated by a newline.
+// SHA256 or MD5 fingerprint; empty falls back to Options.DefaultKey, then
+// SSH_AGENT_CRYPT_KEY, then the first agent key). It returns a single armored
+// line terminated by a newline.
 func Encrypt(input []byte, selector string, options *Options) (string, error) {
+	selector = options.defaultKey(selector)
 	salt := make([]byte, 32)
 	iv := make([]byte, 16)
 	if _, err := io.ReadFull(options.rand(), salt); err != nil {
@@ -257,7 +308,7 @@ func Encrypt(input []byte, selector string, options *Options) (string, error) {
 		return "", err
 	}
 	saltB64 := base64.StdEncoding.EncodeToString(salt)
-	keys, err := deriveKeys(saltB64, selector, options)
+	keys, err := deriveKeys(Namespace, saltB64, selector, options)
 	if err != nil {
 		return "", err
 	}
@@ -271,22 +322,32 @@ func Encrypt(input []byte, selector string, options *Options) (string, error) {
 
 	payload := keys.fingerprint + "." + saltB64 + "." + hex.EncodeToString(iv) + "." + base64.StdEncoding.EncodeToString(ciphertext)
 	mac := hmac.New(sha256.New, keys.mac)
-	mac.Write([]byte(payload))
+	mac.Write([]byte(Prefix + payload))
 	return Prefix + payload + "." + hex.EncodeToString(mac.Sum(nil)) + "\n", nil
 }
 
-// Decrypt unseals the first line of input. For v2 armor the embedded
+// Decrypt unseals the first line of input. For v3 and v2 armor the embedded
 // fingerprint selects the key unless selector is given; v1 armor falls back to
-// the selector or the first agent key.
+// the selector, Options.DefaultKey, SSH_AGENT_CRYPT_KEY, then the first agent
+// key. v3 authenticates its header and signs the Namespace; v2 and v1 sign the
+// `file` namespace.
 func Decrypt(input []byte, selector string, options *Options) ([]byte, error) {
 	line, _, _ := strings.Cut(string(input), "\n")
 	line = strings.TrimSuffix(line, "\r")
-	var payload string
-	var parts []string
+	var prefix, namespace, payload, authenticatedPrefix string
 	switch {
 	case strings.HasPrefix(line, Prefix):
-		payload = strings.TrimPrefix(line, Prefix)
-		parts = strings.Split(payload, ".")
+		prefix, namespace, authenticatedPrefix = Prefix, Namespace, Prefix
+	case strings.HasPrefix(line, legacyPrefixV2):
+		prefix, namespace = legacyPrefixV2, legacyNamespaceV1
+	case strings.HasPrefix(line, legacyPrefixV1):
+		prefix, namespace = legacyPrefixV1, legacyNamespaceV1
+	default:
+		return nil, errors.New("Unsupported format header")
+	}
+	payload = strings.TrimPrefix(line, prefix)
+	parts := strings.Split(payload, ".")
+	if prefix != legacyPrefixV1 {
 		fingerprint := parts[0]
 		parts = parts[1:]
 		if !fingerprintPattern.MatchString(fingerprint) {
@@ -295,21 +356,17 @@ func Decrypt(input []byte, selector string, options *Options) ([]byte, error) {
 		if selector == "" {
 			selector = fingerprint
 		}
-	case strings.HasPrefix(line, legacyPrefix):
-		payload = strings.TrimPrefix(line, legacyPrefix)
-		parts = strings.Split(payload, ".")
-	default:
-		return nil, errors.New("Unsupported format header")
 	}
 	if len(parts) != 4 {
 		return nil, errors.New("Invalid payload")
 	}
+	selector = options.defaultKey(selector)
 	salt, ivHex, ciphertextB64, macHex := parts[0], parts[1], parts[2], parts[3]
-	keys, err := deriveKeys(salt, selector, options)
+	keys, err := deriveKeys(namespace, salt, selector, options)
 	if err != nil {
 		return nil, err
 	}
-	authenticated := payload[:strings.LastIndex(payload, ".")]
+	authenticated := authenticatedPrefix + payload[:strings.LastIndex(payload, ".")]
 	mac := hmac.New(sha256.New, keys.mac)
 	mac.Write([]byte(authenticated))
 	expected := mac.Sum(nil)

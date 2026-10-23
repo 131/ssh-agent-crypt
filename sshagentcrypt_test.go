@@ -2,15 +2,13 @@ package sshagentcrypt
 
 import (
 	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
-	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"testing"
 )
@@ -39,6 +37,12 @@ func startAgent(t *testing.T) *testAgent {
 	pid := regexp.MustCompile(`SSH_AGENT_PID=([0-9]+);`).FindStringSubmatch(string(out))
 	if socket == nil || pid == nil {
 		t.Fatalf("unexpected ssh-agent output: %s", out)
+	}
+	// Tests pick keys explicitly or expect the first agent key: scrub the
+	// default-key variables a developer shell may carry, in-process and for
+	// the subprocesses.
+	for _, name := range defaultKeyEnv {
+		t.Setenv(name, "")
 	}
 	a := &testAgent{t: t, dir: t.TempDir(), socket: socket[1]}
 	a.env = append(os.Environ(), "SSH_AUTH_SOCK="+a.socket, "SSH_AGENT_PID="+pid[1])
@@ -100,9 +104,9 @@ func (a *testAgent) nodeAvailable() bool {
 	return err == nil
 }
 
-func (a *testAgent) node(script string, stdin []byte) []byte {
+func (a *testAgent) node(script string, stdin []byte, args ...string) []byte {
 	a.t.Helper()
-	return a.run("node", stdin, "-e", "const {encrypt, decrypt} = require(process.argv[1]); "+script, repoRoot)
+	return a.run("node", stdin, append([]string{"-e", "const {encrypt, decrypt} = require(process.argv[1]); " + script, repoRoot}, args...)...)
 }
 
 func TestRoundTripFirstKey(t *testing.T) {
@@ -113,7 +117,7 @@ func TestRoundTripFirstKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !regexp.MustCompile(`^ssh-agent-crypt:v2:SHA256:[A-Za-z0-9+/]{43}\.[A-Za-z0-9+/=]+\.[0-9a-f]{32}\.[A-Za-z0-9+/=]+\.[0-9a-f]{64}\n$`).MatchString(armored) {
+	if !regexp.MustCompile(`^ssh-agent-crypt:v3:SHA256:[A-Za-z0-9+/]{43}\.[A-Za-z0-9+/=]+\.[0-9a-f]{32}\.[A-Za-z0-9+/=]+\.[0-9a-f]{64}\n$`).MatchString(armored) {
 		t.Fatalf("unexpected armor: %q", armored)
 	}
 	decrypted, err := Decrypt([]byte(armored), "", a.options())
@@ -197,37 +201,81 @@ func TestPrivateKeyFileWithoutAgent(t *testing.T) {
 	}
 }
 
-func TestLegacyV1(t *testing.T) {
+// TestFixtures pins the armor formats: v1 and v2 samples were produced by the
+// pre-v3 implementations, v3 by the current one, all with the fixture keys.
+// Every implementation must read every version, through the agent and through
+// the key file, and a relabeled header must fail authentication.
+func TestFixtures(t *testing.T) {
 	for _, keyType := range []string{"ed25519", "rsa"} {
-		a := startAgent(t)
-		key := a.createKey("legacy@test", keyType)
-		a.addKey(key)
-		armored, err := Encrypt([]byte("legacy token"), "", a.options())
-		if err != nil {
-			t.Fatal(err)
-		}
-		parts := strings.Split(strings.TrimSpace(strings.TrimPrefix(armored, Prefix)), ".")
-		salt, iv, ciphertext := parts[1], parts[2], parts[3]
-		signed := a.run("ssh-keygen", []byte(salt), "-Y", "sign", "-f", key, "-n", "file")
-		var signature string
-		for _, line := range strings.Split(string(signed), "\n") {
-			if line != "" && !strings.HasPrefix(line, "-----") {
-				signature += line
+		t.Run(keyType, func(t *testing.T) {
+			a := startAgent(t)
+			a.addKey(a.createKey("alpha@test", "ed25519"))
+			key := filepath.Join(repoRoot, "test", "fixtures", keyType)
+			a.addKey(key)
+			for _, version := range []string{"v1", "v2", "v3"} {
+				armored, err := os.ReadFile(filepath.Join(repoRoot, "test", "fixtures", version+"."+keyType+".txt"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				selectors := []string{key, key + ".pub", "fixture-" + keyType + "@test"}
+				if version != "v1" {
+					selectors = append(selectors, "")
+				}
+				for _, selector := range selectors {
+					if got, err := Decrypt(armored, selector, a.options()); err != nil || string(got) != "legacy token" {
+						t.Fatalf("%s go (%q): %q %v", version, selector, got, err)
+					}
+					if got := a.bash(armored, "-decrypt", selector); string(got) != "legacy token" {
+						t.Fatalf("%s bash (%q): %q", version, selector, got)
+					}
+					if a.nodeAvailable() {
+						if got := a.node("decrypt(require('fs').readFileSync(0), process.argv[2] || undefined).then(out => process.stdout.write(out))", armored, selector); string(got) != "legacy token" {
+							t.Fatalf("%s node (%q): %q", version, selector, got)
+						}
+					}
+				}
+				if version == "v3" {
+					fields := strings.Split(strings.TrimPrefix(strings.TrimSpace(string(armored)), Prefix), ".")
+					for i := range fields {
+						changed := append([]string(nil), fields...)
+						if i == 0 {
+							changed[i] = "SHA256:" + strings.Repeat("A", 43)
+						} else if changed[i][0] == 'a' {
+							changed[i] = "b" + changed[i][1:]
+						} else {
+							changed[i] = "a" + changed[i][1:]
+						}
+						if got, err := Decrypt([]byte(Prefix+strings.Join(changed, ".")), key, a.options()); err == nil || err.Error() != "Authentication failed" || len(got) != 0 {
+							t.Fatalf("v3 field %d mutation: %q %v", i, got, err)
+						}
+					}
+					parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(string(armored)), Prefix), ".")
+					salt, err := base64.StdEncoding.DecodeString(parts[1])
+					if err != nil {
+						t.Fatal(err)
+					}
+					iv, err := hex.DecodeString(parts[2])
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, selector := range []string{key, key + ".pub", "fixture-" + keyType + "@test"} {
+						options := &Options{AgentSocket: a.socket, Rand: bytes.NewReader(append(salt, iv...))}
+						got, err := Encrypt([]byte("legacy token"), selector, options)
+						if err != nil || got != string(armored) {
+							t.Fatalf("fixed Go writer (%q): %q %v", selector, got, err)
+						}
+					}
+				}
+				if version == "v1" {
+					continue
+				}
+				other := map[string]string{"v2": "v3", "v3": "v2"}[version]
+				relabeled := []byte(strings.Replace(string(armored), "ssh-agent-crypt:"+version+":", "ssh-agent-crypt:"+other+":", 1))
+				if _, err := Decrypt(relabeled, "", a.options()); err == nil || err.Error() != "Authentication failed" {
+					t.Fatalf("%s relabeled as %s: %v", version, other, err)
+				}
 			}
-		}
-		raw, _ := base64.StdEncoding.DecodeString(signature)
-		sum := sha512.Sum512(raw)
-		material := hex.EncodeToString(sum[:])
-		macKey := sha256.Sum256([]byte("mac:" + material))
-		payload := salt + "." + iv + "." + ciphertext
-		mac := hmac.New(sha256.New, macKey[:])
-		mac.Write([]byte(payload))
-		legacy := []byte("ssh-agent-crypt:v1:" + payload + "." + hex.EncodeToString(mac.Sum(nil)) + "\n")
-		for _, selector := range []string{"", "legacy@test"} {
-			if got, err := Decrypt(legacy, selector, a.options()); err != nil || string(got) != "legacy token" {
-				t.Fatalf("%s v1 (%q): %q %v", keyType, selector, got, err)
-			}
-		}
+		})
 	}
 }
 
@@ -285,10 +333,78 @@ func TestCLIBinaryRoundTrip(t *testing.T) {
 	if out, stderr, err := a.try(binary, tamperLast(armored), "-decrypt"); err == nil || len(out) != 0 || !strings.Contains(stderr, "Authentication failed") {
 		t.Fatalf("tampered: %q %q %v", out, stderr, err)
 	}
+	// An empty selector means the default key, like no selector at all.
+	if got := a.bash(a.run(binary, input, ""), "-decrypt"); !bytes.Equal(got, input) {
+		t.Fatalf("empty selector: %v", got)
+	}
+	for _, args := range [][]string{{"a", "b"}, {"-decrypt", "a", "b"}, {"-x"}} {
+		if out, stderr, err := a.try(binary, input, args...); err == nil || len(out) != 0 || !strings.Contains(stderr, "Usage:") {
+			t.Fatalf("args %v: %q %q %v", args, out, stderr, err)
+		}
+	}
+	if devFull, err := os.OpenFile("/dev/full", os.O_WRONLY, 0); err == nil {
+		defer devFull.Close()
+		for _, decrypt := range []bool{false, true} {
+			cmd := exec.Command(binary)
+			cmd.Stdin = bytes.NewReader(input)
+			if decrypt {
+				cmd = exec.Command(binary, "-decrypt")
+				cmd.Stdin = bytes.NewReader(armored)
+			}
+			cmd.Env = a.env
+			cmd.Stdout = devFull
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err == nil || !strings.Contains(stderr.String(), "Unable to write output") {
+				t.Fatalf("output error (decrypt=%t): %q %v", decrypt, stderr.String(), err)
+			}
+		}
+	}
 	a.env = append(a.env, "SSH_AUTH_SOCK=/nonexistent/agent.sock")
 	if out, stderr, err := a.try(binary, []byte("secret")); err == nil || len(out) != 0 || !strings.Contains(stderr, "Unable to list ssh-agent keys") {
 		t.Fatalf("no agent: %q %q %v", out, stderr, err)
 	}
+}
+
+// TestAgentConnectionsClosed checks that Encrypt and Decrypt do not keep the
+// agent connection open once the key material is derived.
+func TestAgentConnectionsClosed(t *testing.T) {
+	a := startAgent(t)
+	a.addKey(a.createKey("fd@test", "ed25519"))
+	a.addKey(a.createKey("ec-fd@test", "ecdsa"))
+	options := &Options{AgentSocket: a.socket}
+	// Disable finalizers so GC cannot conceal a leaked connection.
+	previousGC := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(previousGC)
+	before := openFiles(t)
+	for i := 0; i < 20; i++ {
+		armored, err := Encrypt([]byte("fd"), "", options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Decrypt([]byte(armored), "", options); err != nil {
+			t.Fatal(err)
+		}
+		for _, selector := range []string{"ec-fd@test", "missing@test"} {
+			if _, err := Encrypt([]byte("fd"), selector, options); err == nil {
+				t.Fatalf("expected rejection for %s", selector)
+			}
+		}
+		if _, err := Decrypt(tamperLast([]byte(armored)), "", options); err == nil {
+			t.Fatal("expected authentication failure")
+		}
+	}
+	if after := openFiles(t); after > before {
+		t.Fatalf("open files grew from %d to %d", before, after)
+	}
+}
+
+func openFiles(t *testing.T) int {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skip("/proc/self/fd not available")
+	}
+	return len(entries)
 }
 
 func tamperLast(armored []byte) []byte {
@@ -299,4 +415,73 @@ func tamperLast(armored []byte) []byte {
 		out[len(out)-1] = 'a'
 	}
 	return append(out, '\n')
+}
+
+func TestECDSAKeyFilesRejectedWithoutAgent(t *testing.T) {
+	a := startAgent(t)
+	key := a.createKey("ec-file@test", "ecdsa")
+	a.addKey(key)
+	for _, socket := range []string{a.socket, "/nonexistent/agent.sock"} {
+		for _, selector := range []string{key, key + ".pub"} {
+			armor, err := Encrypt([]byte("must not encrypt"), selector, &Options{AgentSocket: socket})
+			if err == nil || !strings.HasPrefix(err.Error(), "Unsupported key type: ecdsa-sha2-") || armor != "" {
+				t.Fatalf("%s %s: %q %v", socket, selector, armor, err)
+			}
+		}
+	}
+}
+
+func TestDefaultKeyEnv(t *testing.T) {
+	a := startAgent(t)
+	first := a.createKey("first@test", "ed25519")
+	preferred := a.createKey("preferred@test", "ed25519")
+	a.addKey(first)
+	a.addKey(preferred)
+	a.addKey(filepath.Join(repoRoot, "test", "fixtures", "ed25519"))
+	fingerprintOf := func(path string) string {
+		return strings.Fields(string(a.run("ssh-keygen", nil, "-lf", path+".pub")))[1]
+	}
+	t.Setenv(DefaultKeyEnv, "preferred@test")
+
+	armored, err := Encrypt([]byte("x"), "", a.options())
+	if err != nil || !strings.Contains(armored, fingerprintOf(preferred)) {
+		t.Fatalf("env key: %q %v", armored, err)
+	}
+	armored, err = Encrypt([]byte("x"), "first@test", a.options())
+	if err != nil || !strings.Contains(armored, fingerprintOf(first)) {
+		t.Fatalf("argument wins: %q %v", armored, err)
+	}
+	armored, err = Encrypt([]byte("x"), "", &Options{AgentSocket: a.socket, DefaultKey: "first@test"})
+	if err != nil || !strings.Contains(armored, fingerprintOf(first)) {
+		t.Fatalf("Options.DefaultKey wins over env: %q %v", armored, err)
+	}
+	// Embedded fingerprint wins over the env default when decrypting.
+	toFirst, _ := Encrypt([]byte("for first"), "first@test", a.options())
+	if got, err := Decrypt([]byte(toFirst), "", a.options()); err != nil || string(got) != "for first" {
+		t.Fatalf("fingerprint wins: %q %v", got, err)
+	}
+	// v1 has no fingerprint: the env default selects the key.
+	t.Setenv(DefaultKeyEnv, "fixture-ed25519@test")
+	v1, _ := os.ReadFile(filepath.Join(repoRoot, "test", "fixtures", "v1.ed25519.txt"))
+	if got, err := Decrypt(v1, "", a.options()); err != nil || string(got) != "legacy token" {
+		t.Fatalf("v1 via env: %q %v", got, err)
+	}
+	// Fallback order: SSH_AGENT_CRYPT_KEY, VAUTH_USER_IDENTITY, VAUTH_USER_MAIL.
+	t.Setenv(DefaultKeyEnv, "")
+	t.Setenv("VAUTH_USER_MAIL", "preferred@test")
+	if armored, err := Encrypt([]byte("x"), "", a.options()); err != nil || !strings.Contains(armored, fingerprintOf(preferred)) {
+		t.Fatalf("VAUTH_USER_MAIL: %q %v", armored, err)
+	}
+	t.Setenv("VAUTH_USER_IDENTITY", "first@test")
+	if armored, err := Encrypt([]byte("x"), "", a.options()); err != nil || !strings.Contains(armored, fingerprintOf(first)) {
+		t.Fatalf("VAUTH_USER_IDENTITY beats MAIL: %q %v", armored, err)
+	}
+	t.Setenv(DefaultKeyEnv, "preferred@test")
+	if armored, err := Encrypt([]byte("x"), "", a.options()); err != nil || !strings.Contains(armored, fingerprintOf(preferred)) {
+		t.Fatalf("SSH_AGENT_CRYPT_KEY beats VAUTH: %q %v", armored, err)
+	}
+	t.Setenv(DefaultKeyEnv, "nobody@test")
+	if _, err := Encrypt([]byte("x"), "", a.options()); err == nil || err.Error() != "Key not found: nobody@test" {
+		t.Fatalf("missing env key: %v", err)
+	}
 }

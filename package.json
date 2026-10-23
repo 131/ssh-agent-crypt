@@ -6,10 +6,11 @@
     "test": "node --test"
   },
   "bin": {
-    "ssh-agent-crypt": "./bin/ssh-agent-crypt"
+    "ssh-agent-crypt": "./bin/ssh-agent-crypt.js"
   },
   "files": [
     "index.js",
+    "bin/ssh-agent-crypt.js",
     "bin/ssh-agent-crypt",
     "README.md"
   ],

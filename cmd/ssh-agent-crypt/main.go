@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	sshagentcrypt "github.com/131/ssh-agent-crypt"
 )
@@ -20,12 +21,14 @@ Key can be:
   - key comment (e.g. "user@host")
   - SHA256 fingerprint
   - MD5 fingerprint
-  - omitted -> first key from ssh-agent
+  - omitted -> SSH_AGENT_CRYPT_KEY, VAUTH_USER_IDENTITY, VAUTH_USER_MAIL,
+               else first key from ssh-agent
 
 Notes:
   - Encryption: AES-256-CBC + HMAC-SHA256
   - Format:
-      ssh-agent-crypt:v2:<fingerprint>.<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
+      ssh-agent-crypt:v3:<fingerprint>.<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
+    (v2 and v1 payloads remain readable)
 `, os.Args[0])
 	os.Exit(1)
 }
@@ -38,10 +41,13 @@ func main() {
 	case len(args) == 0:
 	case args[0] == "-decrypt":
 		decrypt = true
+		if len(args) > 2 {
+			usage()
+		}
 		if len(args) > 1 {
 			selector = args[1]
 		}
-	case args[0][0] == '-':
+	case strings.HasPrefix(args[0], "-"), len(args) > 1:
 		usage()
 	default:
 		selector = args[0]
@@ -57,14 +63,20 @@ func main() {
 		if err != nil {
 			fail(err)
 		}
-		os.Stdout.Write(plaintext)
+		write(plaintext)
 		return
 	}
 	armored, err := sshagentcrypt.Encrypt(input, selector, nil)
 	if err != nil {
 		fail(err)
 	}
-	os.Stdout.WriteString(armored)
+	write([]byte(armored))
+}
+
+func write(output []byte) {
+	if _, err := os.Stdout.Write(output); err != nil {
+		fail(fmt.Errorf("Unable to write output: %w", err))
+	}
 }
 
 func fail(err error) {

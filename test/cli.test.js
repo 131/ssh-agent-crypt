@@ -79,7 +79,9 @@ async function listAgentKeys(env) {
 
 async function withAgent(callback) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-agent-crypt-"));
-  const env = startAgent({...process.env});
+  // Tests pick keys explicitly or expect the first agent key: scrub the
+  // default-key variables a developer shell may carry.
+  const env = startAgent({...process.env, SSH_AGENT_CRYPT_KEY: "", VAUTH_USER_IDENTITY: "", VAUTH_USER_MAIL: ""});
 
   try {
     await callback({tmpDir, env});
@@ -104,7 +106,7 @@ test("round-trips with the first ssh-agent identity", async () => {
 
     const lines = encrypted.stdout.trimEnd().split("\n");
     assert.equal(lines.length, 1);
-    assert.match(lines[0], /^ssh-agent-crypt:v2:SHA256:[A-Za-z0-9+/]{43}\.[A-Za-z0-9+/=]+\.[0-9a-f]+\.[A-Za-z0-9+/=]+\.[0-9a-f]+$/);
+    assert.match(lines[0], /^ssh-agent-crypt:v3:SHA256:[A-Za-z0-9+/]{43}\.[A-Za-z0-9+/=]+\.[0-9a-f]+\.[A-Za-z0-9+/=]+\.[0-9a-f]+$/);
 
     const decrypted = run("bash", [CLI_PATH, "-decrypt"], {env, input: encrypted.stdout});
     assertSuccess(decrypted, "decrypt default key");
@@ -224,16 +226,124 @@ test("Node API interoperates with the shipped CLI", async () => {
     addKey(env, alpha.privateKey);
     const plaintext = "node API\nwithout a trailing newline";
     const armored = await encrypt(plaintext, "node@test", {env});
-    assert.match(armored, /^ssh-agent-crypt:v2:/);
-    assert.equal(await decrypt(armored, "node@test", {env}), plaintext);
+    assert.match(armored, /^ssh-agent-crypt:v3:/);
+    assert.equal((await decrypt(armored, "node@test", {env})).toString(), plaintext);
     const decrypted = run("bash", [CLI_PATH, "-decrypt", "node@test"], {env, input: armored});
     assertSuccess(decrypted, "CLI decrypts Node armor");
     assert.equal(decrypted.stdout, plaintext);
     const encrypted = run("bash", [CLI_PATH, "node@test"], {env, input: plaintext});
     assertSuccess(encrypted, "CLI encrypts for Node");
-    assert.equal(await decrypt(encrypted.stdout, "node@test", {env}), plaintext);
+    assert.equal((await decrypt(encrypted.stdout, "node@test", {env})).toString(), plaintext);
     await assert.rejects(() => decrypt(armored.replace(/.$/m, "x"), "node@test", {env}), /Authentication failed/);
     await assert.rejects(() => encrypt(plaintext, "missing@test", {env}), /Key not found/);
+  });
+});
+
+test("Node CLI (npm bin) interoperates with Bash and matches its interface", async () => {
+  const NODE_CLI = path.join(REPO_ROOT, "bin", "ssh-agent-crypt.js");
+  const {decrypt} = require("..");
+  await withAgent(async ({tmpDir, env}) => {
+    addKey(env, createKey(tmpDir, "nodecli@test").privateKey);
+    const payload = Buffer.from("node cli\n\x00\xff binary tail");
+    const armored = run(process.execPath, [NODE_CLI, "nodecli@test"], {env, input: payload, encoding: null});
+    assertSuccess(armored, "Node CLI encrypts");
+    assert.match(armored.stdout.toString(), /^ssh-agent-crypt:v3:/);
+    const fromBash = run("bash", [CLI_PATH, "-decrypt", "nodecli@test"], {env, input: armored.stdout, encoding: null});
+    assertSuccess(fromBash, "Bash decrypts Node CLI armor");
+    assert.deepEqual(fromBash.stdout, payload);
+    const bashArmor = run("bash", [CLI_PATH, "nodecli@test"], {env, input: payload, encoding: null});
+    const fromNode = run(process.execPath, [NODE_CLI, "-decrypt"], {env, input: bashArmor.stdout, encoding: null});
+    assertSuccess(fromNode, "Node CLI decrypts Bash armor");
+    assert.deepEqual(fromNode.stdout, payload);
+    assert.deepEqual(await decrypt(armored.stdout, undefined, {env}), payload);
+    for(const args of [["-x"], ["a", "b"], ["-decrypt", "a", "b"]]) {
+      const bad = run(process.execPath, [NODE_CLI, ...args], {env, input: ""});
+      assert.equal(bad.status, 1, `usage for ${args.join(" ")}`);
+      assert.match(bad.stderr, /^Usage:/);
+    }
+    const tampered = run(process.execPath, [NODE_CLI, "-decrypt"], {env, input: armored.stdout.toString().replace(/(.)\n$/, (m, c) => (c === "0" ? "1" : "0") + "\n")});
+    assert.equal(tampered.status, 1);
+    assert.match(tampered.stderr, /Authentication failed/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"))).bin["ssh-agent-crypt"], "./bin/ssh-agent-crypt.js");
+  });
+});
+
+test("SSH_AGENT_CRYPT_KEY stands in for the key argument, embedded fingerprints win", async () => {
+  const NODE_CLI = path.join(REPO_ROOT, "bin", "ssh-agent-crypt.js");
+  const {encrypt, decrypt} = require("..");
+  const fixtures = path.join(REPO_ROOT, "test", "fixtures");
+  await withAgent(async ({tmpDir, env: base}) => {
+    const first = createKey(tmpDir, "first@test");
+    const preferred = createKey(tmpDir, "preferred@test");
+    addKey(base, first.privateKey);
+    addKey(base, preferred.privateKey);
+    addKey(base, path.join(fixtures, "ed25519"));
+    const fp = comment => run("ssh-keygen", ["-lf", comment === "first@test" ? first.publicKey : preferred.publicKey]).stdout.split(" ")[1];
+    const env = {...base, SSH_AGENT_CRYPT_KEY: "preferred@test"};
+    const goBinary = run("bash", ["-c", "command -v go"]).status === 0 ? path.join(tmpDir, "ssh-agent-crypt-go") : null;
+    if(goBinary)
+      assertSuccess(run("go", ["build", "-o", goBinary, "./cmd/ssh-agent-crypt"], {cwd: REPO_ROOT, env}), "go build");
+    const writers = {
+      api: (input, key, e) => encrypt(input, key, {env: e}),
+      bash: (input, key, e) => run("bash", [CLI_PATH, ...(key ? [key] : [])], {env: e, input}).stdout,
+      node: (input, key, e) => run(process.execPath, [NODE_CLI, ...(key ? [key] : [])], {env: e, input}).stdout,
+      ...(goBinary ? {go: (input, key, e) => run(goBinary, [...(key ? [key] : [])], {env: e, input}).stdout} : {}),
+    };
+    const readers = {
+      api: async (armor, key, e) => (await decrypt(armor, key, {env: e})).toString(),
+      bash: (armor, key, e) => run("bash", [CLI_PATH, "-decrypt", ...(key ? [key] : [])], {env: e, input: armor}).stdout,
+      node: (armor, key, e) => run(process.execPath, [NODE_CLI, "-decrypt", ...(key ? [key] : [])], {env: e, input: armor}).stdout,
+      ...(goBinary ? {go: (armor, key, e) => run(goBinary, ["-decrypt", ...(key ? [key] : [])], {env: e, input: armor}).stdout} : {}),
+    };
+    for(const [name, write] of Object.entries(writers)) {
+      // No argument: env picks the key; without env, the first agent key.
+      assert.ok((await write("x", undefined, env)).includes(fp("preferred@test")), `${name}: env key`);
+      assert.ok((await write("x", undefined, base)).includes(fp("first@test")), `${name}: first key`);
+      // Explicit argument beats env.
+      assert.ok((await write("x", "first@test", env)).includes(fp("first@test")), `${name}: argument wins`);
+    }
+    const toFirst = await encrypt("for first", "first@test", {env: base});
+    const v1 = fs.readFileSync(path.join(fixtures, "v1.ed25519.txt"), "utf8");
+    for(const [name, read] of Object.entries(readers)) {
+      // v3 addressed to another key still decrypts with env set: embedded fingerprint wins.
+      assert.equal(await read(toFirst, undefined, env), "for first", `${name}: fingerprint wins over env`);
+      // v1 has no fingerprint: env selects the key (the fixture key here).
+      assert.equal(await read(v1, undefined, {...base, SSH_AGENT_CRYPT_KEY: "fixture-ed25519@test"}), "legacy token", `${name}: v1 via env`);
+    }
+    // Fallback order: SSH_AGENT_CRYPT_KEY, VAUTH_USER_IDENTITY, VAUTH_USER_MAIL.
+    for(const [name, write] of Object.entries(writers)) {
+      const vauth = {...base, VAUTH_USER_MAIL: "preferred@test"};
+      assert.ok((await write("x", undefined, vauth)).includes(fp("preferred@test")), `${name}: VAUTH_USER_MAIL`);
+      assert.ok((await write("x", undefined, {...vauth, VAUTH_USER_IDENTITY: "first@test"})).includes(fp("first@test")), `${name}: VAUTH_USER_IDENTITY beats MAIL`);
+      assert.ok((await write("x", undefined, {...vauth, VAUTH_USER_IDENTITY: "first@test", SSH_AGENT_CRYPT_KEY: "preferred@test"})).includes(fp("preferred@test")), `${name}: SSH_AGENT_CRYPT_KEY beats VAUTH`);
+    }
+    const missing = run("bash", [CLI_PATH], {env: {...base, SSH_AGENT_CRYPT_KEY: "nobody@test"}, input: "x"});
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /Key not found: nobody@test/);
+    await assert.rejects(() => encrypt("x", undefined, {env: {...base, SSH_AGENT_CRYPT_KEY: "nobody@test"}}), /Key not found: nobody@test/);
+  });
+});
+
+test("Node API round-trips binary payloads with Go and Bash", async () => {
+  const {encrypt, decrypt} = require("..");
+  await withAgent(async ({tmpDir, env}) => {
+    addKey(env, createKey(tmpDir, "binary@test").privateKey);
+    const payload = Buffer.from([0x00, 0xff, 0xfe, 0x80, 0xc3, 0x28, 0x0a, 0x0d, 0x00, 0x9f]);
+    const armored = await encrypt(payload, "binary@test", {env});
+    assert.deepEqual(await decrypt(armored, "binary@test", {env}), payload);
+    const fromBash = run("bash", [CLI_PATH, "-decrypt", "binary@test"], {env, input: armored, encoding: null});
+    assertSuccess(fromBash, "Bash decrypts binary Node armor");
+    assert.deepEqual(fromBash.stdout, payload);
+    const toNode = run("bash", [CLI_PATH, "binary@test"], {env, input: payload, encoding: null});
+    assertSuccess(toNode, "Bash encrypts binary for Node");
+    assert.deepEqual(await decrypt(toNode.stdout, "binary@test", {env}), payload);
+    if(run("bash", ["-c", "command -v go"]).status === 0) {
+      const goBinary = path.join(tmpDir, "ssh-agent-crypt-go");
+      assertSuccess(run("go", ["build", "-o", goBinary, "./cmd/ssh-agent-crypt"], {cwd: REPO_ROOT, env}), "go build");
+      const fromGo = run(goBinary, ["-decrypt", "binary@test"], {env, input: armored, encoding: null});
+      assertSuccess(fromGo, "Go decrypts binary Node armor");
+      assert.deepEqual(fromGo.stdout, payload);
+    }
   });
 });
 
@@ -256,10 +366,10 @@ for(const type of ['ed25519', 'rsa']) {
         assert.equal(bash.stdout, plaintext);
         const encrypted = run('bash', [CLI_PATH, selected.comment], {env, input: plaintext});
         assertSuccess(encrypted, 'Bash encrypts');
-        assert.equal(await decrypt(encrypted.stdout, selector, {env}), plaintext);
+        assert.equal((await decrypt(encrypted.stdout, selector, {env})).toString(), plaintext);
       }
       const empty = await encrypt('', undefined, {env});
-      assert.equal(await decrypt(empty, undefined, {env}), '');
+      assert.equal((await decrypt(empty, undefined, {env})).toString(), '');
       const bashEmpty = run('bash', [CLI_PATH, '-decrypt'], {env, input: empty});
       assertSuccess(bashEmpty, 'empty ciphertext');
       assert.equal(bashEmpty.stdout, '');
@@ -281,7 +391,7 @@ test('JS private key mode interoperates without an agent', async () => {
     assert.equal(bash.stdout, 'private key');
     const encrypted = run('bash', [CLI_PATH, key.privateKey], {env, input: 'reverse'});
     assertSuccess(encrypted, 'private key Bash encrypt');
-    assert.equal(await decrypt(encrypted.stdout, key.privateKey, {env}), 'reverse');
+    assert.equal((await decrypt(encrypted.stdout, key.privateKey, {env})).toString(), 'reverse');
   } finally {
     fs.rmSync(tmpDir, {recursive: true, force: true});
   }
@@ -297,7 +407,7 @@ test('JS rejects ECDSA, missing agents and malformed armor', async () => {
   });
   await assert.rejects(() => encrypt('secret', undefined, {env: {...process.env, SSH_AUTH_SOCK: ''}}));
   await assert.rejects(() => decrypt('plaintext'), /Unsupported format header/);
-  await assert.rejects(() => decrypt('ssh-agent-crypt:v2:missing.parts'), /Invalid key fingerprint/);
+  await assert.rejects(() => decrypt('ssh-agent-crypt:v3:missing.parts'), /Invalid key fingerprint/);
 });
 
 
@@ -308,12 +418,12 @@ test('JS encryption and decryption work with no executables on PATH', async () =
     addKey(env, key.privateKey);
     const options = {env: {...env, PATH: tmpDir}};
     const armor = await encrypt('no subprocess', undefined, options);
-    assert.equal(await decrypt(armor, undefined, options), 'no subprocess');
+    assert.equal((await decrypt(armor, undefined, options)).toString(), 'no subprocess');
   });
 });
 
 for(const type of ['ed25519', 'rsa']) {
-  test(`v2 selects the embedded fingerprint after agent key reordering (${type})`, async () => {
+  test(`v3 selects the embedded fingerprint after agent key reordering (${type})`, async () => {
     const {encrypt, decrypt} = require('..');
     await withAgent(async ({tmpDir, env}) => {
       const alpha = createKey(tmpDir, 'alpha@test');
@@ -324,16 +434,16 @@ for(const type of ['ed25519', 'rsa']) {
       const bashArmor = run('bash', [CLI_PATH], {env, input: 'from Bash'});
       assertSuccess(bashArmor, 'Bash encrypt');
       const fingerprint = run('ssh-keygen', ['-lf', beta.publicKey]).stdout.split(/\s+/)[1];
-      assert.ok(jsArmor.startsWith(`ssh-agent-crypt:v2:${fingerprint}.`));
-      assert.ok(bashArmor.stdout.startsWith(`ssh-agent-crypt:v2:${fingerprint}.`));
+      assert.ok(jsArmor.startsWith(`ssh-agent-crypt:v3:${fingerprint}.`));
+      assert.ok(bashArmor.stdout.startsWith(`ssh-agent-crypt:v3:${fingerprint}.`));
       assertSuccess(run('ssh-add', ['-D'], {env}), 'remove identities');
       addKey(env, alpha.privateKey);
       addKey(env, beta.privateKey);
-      assert.equal(await decrypt(bashArmor.stdout, undefined, {env}), 'from Bash');
+      assert.equal((await decrypt(bashArmor.stdout, undefined, {env})).toString(), 'from Bash');
       const decoded = run('bash', [CLI_PATH, '-decrypt'], {env, input: jsArmor});
       assertSuccess(decoded, 'Bash decrypt reordered keys');
       assert.equal(decoded.stdout, 'from JS');
-      assert.equal(await decrypt(jsArmor, undefined, {env}), 'from JS');
+      assert.equal((await decrypt(jsArmor, undefined, {env})).toString(), 'from JS');
       // The fingerprint must be authenticated even with an explicit selector.
       const other = run('ssh-keygen', ['-lf', alpha.publicKey]).stdout.split(/\s+/)[1];
       const tampered = jsArmor.replace(fingerprint, other);
@@ -351,29 +461,32 @@ for(const type of ['ed25519', 'rsa']) {
 }
 
 for(const type of ['ed25519', 'rsa']) {
-  test(`v1 remains readable without changing the v2 encryption flow (${type})`, async () => {
+  test(`fixtures: v1, v2 and v3 armors stay readable, relabeled headers fail (${type})`, async () => {
     const {decrypt} = require('..');
+    const fixtures = path.join(REPO_ROOT, 'test', 'fixtures');
+    const key = path.join(fixtures, type);
     await withAgent(async ({tmpDir, env}) => {
-      const key = createKey(tmpDir, 'legacy@test', type);
-      addKey(env, key.privateKey);
-      const encrypted = run('bash', [CLI_PATH], {env, input: 'legacy token'});
-      assertSuccess(encrypted, 'Bash encryption');
-      const [, salt, iv, ciphertext] = encrypted.stdout.trim().slice('ssh-agent-crypt:v2:'.length).split('.');
-      const signed = run('ssh-keygen', ['-Y', 'sign', '-f', key.privateKey, '-n', 'file'], {env, input: salt});
-      assertSuccess(signed, 'sign legacy salt');
-      const {createHash, createHmac} = require('crypto');
-      const signature = signed.stdout.split('\n').filter(line => line && !line.startsWith('-----')).join('');
-      const material = createHash('sha512').update(Buffer.from(signature, 'base64')).digest('hex');
-      const macKey = createHash('sha256').update('mac:' + material).digest();
-      const payload = `${salt}.${iv}.${ciphertext}`;
-      const mac = createHmac('sha256', macKey).update(payload).digest('hex');
-      const armored = {stdout: `ssh-agent-crypt:v1:${payload}.${mac}\n`};
-      assert.match(armored.stdout, /^ssh-agent-crypt:v1:/);
-      assert.equal(await decrypt(armored.stdout, undefined, {env}), 'legacy token');
-      assert.equal(await decrypt(armored.stdout, key.comment, {env}), 'legacy token');
-      const decoded = run('bash', [CLI_PATH, '-decrypt'], {env, input: armored.stdout});
-      assertSuccess(decoded, 'Bash reads original v1');
-      assert.equal(decoded.stdout, 'legacy token');
+      addKey(env, createKey(tmpDir, 'alpha@test').privateKey);
+      addKey(env, key);
+      for(const version of ['v1', 'v2', 'v3']) {
+        const armored = fs.readFileSync(path.join(fixtures, `${version}.${type}.txt`), 'utf8');
+        assert.ok(armored.startsWith(`ssh-agent-crypt:${version}:`));
+        const selectors = [key, `fixture-${type}@test`, ...(version === 'v1' ? [] : [undefined])];
+        for(const selector of selectors) {
+          assert.equal((await decrypt(armored, selector, {env})).toString(), 'legacy token', `${version} node ${selector}`);
+          const bash = run('bash', [CLI_PATH, '-decrypt', ...(selector ? [selector] : [])], {env, input: armored});
+          assertSuccess(bash, `${version} bash ${selector}`);
+          assert.equal(bash.stdout, 'legacy token');
+        }
+        if(version === 'v1')
+          continue;
+        const other = version === 'v2' ? 'v3' : 'v2';
+        const relabeled = armored.replace(`ssh-agent-crypt:${version}:`, `ssh-agent-crypt:${other}:`);
+        await assert.rejects(() => decrypt(relabeled, undefined, {env}), /Authentication failed/);
+        const bash = run('bash', [CLI_PATH, '-decrypt'], {env, input: relabeled});
+        assert.notEqual(bash.status, 0);
+        assert.match(bash.stderr, /Authentication failed/);
+      }
     });
   });
 }
@@ -432,7 +545,7 @@ exec '${realAdd}' "$@"
     assertSuccess(result, 'wait for producer');
     assert.ok(fs.existsSync(marker));
     const {decrypt} = require('..');
-    assert.equal(await decrypt(result.stdout, undefined, {env}), 'pipeline input\n\n');
+    assert.equal((await decrypt(result.stdout, undefined, {env})).toString(), 'pipeline input\n\n');
   });
 });
 
@@ -466,11 +579,11 @@ test('Go CLI interoperates with Bash and Node', {skip: !GO_AVAILABLE && 'go not 
       const plaintext = `Go ${type}: coucou bibou 🐻\n`;
       const goArmor = run(goBinary, [key.comment], {env, input: plaintext});
       assertSuccess(goArmor, 'Go encrypts');
-      assert.match(goArmor.stdout, /^ssh-agent-crypt:v2:SHA256:/);
+      assert.match(goArmor.stdout, /^ssh-agent-crypt:v3:SHA256:/);
       const bash = run('bash', [CLI_PATH, '-decrypt'], {env, input: goArmor.stdout});
       assertSuccess(bash, 'Bash decrypts Go');
       assert.equal(bash.stdout, plaintext);
-      assert.equal(await decrypt(goArmor.stdout, undefined, {env}), plaintext);
+      assert.equal((await decrypt(goArmor.stdout, undefined, {env})).toString(), plaintext);
       const bashArmor = run('bash', [CLI_PATH, key.comment], {env, input: plaintext});
       assertSuccess(bashArmor, 'Bash encrypts');
       const goFromBash = run(goBinary, ['-decrypt'], {env, input: bashArmor.stdout});
@@ -480,8 +593,166 @@ test('Go CLI interoperates with Bash and Node', {skip: !GO_AVAILABLE && 'go not 
       assertSuccess(goFromNode, 'Go decrypts Node');
       assert.equal(goFromNode.stdout, plaintext);
     }
-    const tampered = run(goBinary, ['-decrypt'], {env, input: 'ssh-agent-crypt:v2:SHA256:' + 'A'.repeat(43) + '.c2FsdA==.00.AA==.00\n'});
+    const tampered = run(goBinary, ['-decrypt'], {env, input: 'ssh-agent-crypt:v3:SHA256:' + 'A'.repeat(43) + '.c2FsdA==.00.AA==.00\n'});
     assert.notEqual(tampered.status, 0);
     assert.equal(tampered.stdout, '');
+  });
+});
+
+for(const agentAvailable of [true, false]) {
+  test(`Bash rejects ECDSA key files ${agentAvailable ? 'with' : 'without'} an agent`, async () => {
+    await withAgent(async ({tmpDir, env}) => {
+      const key = createKey(tmpDir, 'ecdsa-file@test', 'ecdsa');
+      addKey(env, key.privateKey);
+      const selectedEnv = {...env};
+      if(!agentAvailable) {
+        delete selectedEnv.SSH_AUTH_SOCK;
+        delete selectedEnv.SSH_AGENT_PID;
+      }
+      for(const selector of [key.privateKey, key.publicKey]) {
+        const result = run('bash', [CLI_PATH, selector], {env: selectedEnv, input: 'must not encrypt'});
+        assert.notEqual(result.status, 0);
+        assert.equal(result.stdout, '');
+        assert.match(result.stderr, /Unsupported key type: ecdsa-sha2-/);
+      }
+    });
+  });
+}
+
+test('Bash public key files require the agent, even beside a private key', async () => {
+  await withAgent(async ({tmpDir, env}) => {
+    const key = createKey(tmpDir, 'public-only@test');
+    addKey(env, key.privateKey);
+    const armored = run('bash', [CLI_PATH, key.publicKey], {env, input: 'agent-backed'});
+    assertSuccess(armored, 'public key with agent');
+    const plaintext = run('bash', [CLI_PATH, '-decrypt', key.publicKey], {env, input: armored.stdout});
+    assertSuccess(plaintext, 'decrypt with public key');
+    assert.equal(plaintext.stdout, 'agent-backed');
+    assertSuccess(run('ssh-add', ['-d', key.privateKey], {env}), 'remove private key from agent');
+    for(const selectedEnv of [env, {...env, SSH_AUTH_SOCK: ''}]) {
+      const result = run('bash', [CLI_PATH, key.publicKey], {env: selectedEnv, input: 'must not encrypt'});
+      assert.notEqual(result.status, 0);
+      assert.equal(result.stdout, '');
+      assert.match(result.stderr, /Unable to derive/);
+    }
+  });
+});
+
+test('fixed fixtures pin legacy readers and exact Bash/Node v3 writers', async () => {
+  const {decrypt} = require('..');
+  await withAgent(async ({tmpDir, env}) => {
+    const fixtureDir = path.join(__dirname, 'fixtures');
+    const realOpenSSL = run('which', ['openssl']).stdout.trim();
+    const mockDir = path.join(tmpDir, 'mock-bin');
+    fs.mkdirSync(mockDir);
+    // Only replace entropy for this known-answer test, never production code.
+    fs.writeFileSync(path.join(mockDir, 'openssl'), `#!/usr/bin/env bash
+if [ "$*" = 'rand -base64 32' ]; then printf '%s\\n' "$FIXTURE_SALT"; exit; fi
+if [ "$*" = 'rand -hex 16' ]; then printf '%s\\n' "$FIXTURE_IV"; exit; fi
+exec '${realOpenSSL}' "$@"
+`, {mode: 0o700});
+    for(const type of ['ed25519', 'rsa']) {
+      const key = path.join(fixtureDir, type);
+      addKey(env, key);
+      for(const version of ['v1', 'v2', 'v3']) {
+        const armor = fs.readFileSync(path.join(fixtureDir, `${version}.${type}.txt`), 'utf8');
+        for(const selector of [key, key + '.pub', `fixture-${type}@test`, ...(version === 'v1' ? [] : [undefined])]) {
+          const result = run('bash', [CLI_PATH, '-decrypt', ...(selector ? [selector] : [])], {env, input: armor});
+          assertSuccess(result, `Bash ${version} ${type}`);
+          assert.equal(result.stdout, 'legacy token');
+          assert.equal((await decrypt(armor, selector, {env})).toString(), 'legacy token');
+        }
+        // Neither a changed header nor a malformed MAC may be accepted.
+        const mutations = [armor.trimEnd() + 'zz\n'];
+        if(version === 'v3') {
+          const fields = armor.trimEnd().slice('ssh-agent-crypt:v3:'.length).split('.');
+          for(let i = 0; i < fields.length; ++i) {
+            const changed = [...fields];
+            if(i === 0)
+              changed[i] = 'SHA256:' + 'A'.repeat(43);
+            else
+              changed[i] = (changed[i][0] === 'a' ? 'b' : 'a') + changed[i].slice(1);
+            mutations.push('ssh-agent-crypt:v3:' + changed.join('.') + '\n');
+          }
+        }
+        if(version !== 'v1')
+          mutations.push(armor.replace(`:${version}:`, version === 'v3' ? ':v2:' : ':v3:'));
+        for(const input of mutations) {
+          const result = run('bash', [CLI_PATH, '-decrypt', key], {env, input});
+          assert.notEqual(result.status, 0);
+          assert.equal(result.stdout, '');
+          await assert.rejects(decrypt(input, key, {env}), /Authentication failed/);
+        }
+        if(version !== 'v3')
+          continue;
+        const fields = armor.trimEnd().slice('ssh-agent-crypt:v3:'.length).split('.');
+        const fixedEnv = {...env, PATH: `${mockDir}:${env.PATH}`, FIXTURE_SALT: fields[1], FIXTURE_IV: fields[2]};
+        const bash = run('bash', [CLI_PATH, key], {env: fixedEnv, input: 'legacy token'});
+        assertSuccess(bash, 'fixed Bash writer');
+        assert.equal(bash.stdout, armor);
+        // A fresh process loads encrypt after injecting the fixed random bytes.
+        const script = `
+          const crypto = require('crypto');
+          const entropy = [Buffer.from(process.env.FIXTURE_SALT, 'base64'), Buffer.from(process.env.FIXTURE_IV, 'hex')];
+          crypto.randomBytes = size => {
+            const bytes = entropy.shift();
+            if(!bytes || bytes.length !== size) throw new Error('Unexpected entropy request');
+            return bytes;
+          };
+          require(process.argv[1]).encrypt('legacy token', process.argv[2]).then(out => process.stdout.write(out));
+        `;
+        const node = run('node', ['-e', script, REPO_ROOT, key], {env: fixedEnv});
+        assertSuccess(node, 'fixed Node writer');
+        assert.equal(node.stdout, armor);
+      }
+    }
+  });
+});
+
+test('Bash keeps encrypted private key files usable through the agent', async () => {
+  await withAgent(async ({tmpDir, env}) => {
+    for(const type of ['ed25519', 'rsa', 'ecdsa']) {
+      const key = createKey(tmpDir, `encrypted-${type}@test`, type);
+      addKey(env, key.privateKey);
+      assertSuccess(run('ssh-keygen', ['-q', '-p', '-P', '', '-N', 'test-only-passphrase', '-f', key.privateKey]), 'encrypt private key');
+      const encrypted = run('bash', [CLI_PATH, key.privateKey], {env, input: 'agent-unlocked'});
+      if(type === 'ecdsa') {
+        assert.notEqual(encrypted.status, 0);
+        assert.equal(encrypted.stdout, '');
+        assert.match(encrypted.stderr, /Unsupported key type: ecdsa-sha2-/);
+      } else {
+        assertSuccess(encrypted, 'sign encrypted private file through agent');
+        const decoded = run('bash', [CLI_PATH, '-decrypt', key.privateKey], {env, input: encrypted.stdout});
+        assertSuccess(decoded, 'decrypt with encrypted private file');
+        assert.equal(decoded.stdout, 'agent-unlocked');
+      }
+    }
+  });
+});
+
+test('Bash inspects and signs the private file, not a stale public sibling', async () => {
+  await withAgent(async ({tmpDir, env}) => {
+    const ec = createKey(tmpDir, 'stale-ec@test', 'ecdsa');
+    const rsa = createKey(tmpDir, 'stale-rsa@test', 'rsa');
+    const ed = createKey(tmpDir, 'stale-ed@test', 'ed25519');
+    for(const key of [ec, rsa, ed])
+      addKey(env, key.privateKey);
+    const rsaFingerprint = run('ssh-keygen', ['-lf', rsa.publicKey]).stdout.trim().split(/\s+/)[1];
+    fs.copyFileSync(rsa.publicKey, ec.publicKey);
+    fs.copyFileSync(ed.publicKey, rsa.publicKey);
+    for(const selectedEnv of [env, {...env, SSH_AUTH_SOCK: ''}]) {
+      const rejected = run('bash', [CLI_PATH, ec.privateKey], {env: selectedEnv, input: 'must reject'});
+      assert.notEqual(rejected.status, 0);
+      assert.equal(rejected.stdout, '');
+      assert.match(rejected.stderr, /Unsupported key type: ecdsa-sha2-/);
+    }
+    const encrypted = run('bash', [CLI_PATH, rsa.privateKey], {env, input: 'actual RSA key'});
+    assertSuccess(encrypted, 'sign actual private file');
+    assert.ok(encrypted.stdout.startsWith('ssh-agent-crypt:v3:' + rsaFingerprint + '.'));
+    for(const selector of [undefined, rsa.privateKey]) {
+      const decoded = run('bash', [CLI_PATH, '-decrypt', ...(selector ? [selector] : [])], {env, input: encrypted.stdout});
+      assertSuccess(decoded, 'decrypt actual RSA key');
+      assert.equal(decoded.stdout, 'actual RSA key');
+    }
   });
 });

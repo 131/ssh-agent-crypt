@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-FORMAT_PREFIX="ssh-agent-crypt:v2:"
+FORMAT_PREFIX="ssh-agent-crypt:v3:"
+NAMESPACE="ssh-agent-crypt"
+LEGACY_NAMESPACE="file"
 
 usage() {
   cat <<USAGE
@@ -14,12 +16,14 @@ Key can be:
   - key comment (e.g. "user@host")
   - SHA256 fingerprint
   - MD5 fingerprint
-  - omitted -> first key from ssh-agent
+  - omitted -> SSH_AGENT_CRYPT_KEY, VAUTH_USER_IDENTITY, VAUTH_USER_MAIL,
+               else first key from ssh-agent
 
 Notes:
   - Encryption: AES-256-CBC + HMAC-SHA256
   - Format:
-      ssh-agent-crypt:v2:<fingerprint>.<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
+      ssh-agent-crypt:v3:<fingerprint>.<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
+    (v2 and v1 payloads remain readable)
 USAGE
   exit 1
 }
@@ -46,13 +50,21 @@ case "${1:-}" in
     ;;
 esac
 
-if [ -n "$KEY" ] && [ -f "$KEY" ]; then
-  IFS= read -r first_line < "$KEY" || true
-  case "$first_line" in
-    ssh-*|ecdsa-sha2-*|sk-ssh-*|sk-ecdsa-*) ;;&
-    *) KEY_FILE="$KEY" ;;&
-  esac
-fi
+# A missing key argument falls back to the environment (same syntax):
+# SSH_AGENT_CRYPT_KEY, then the vauth identity variables. An embedded
+# fingerprint still wins when decrypting v2/v3 payloads.
+DEFAULT_KEY="${SSH_AGENT_CRYPT_KEY:-${VAUTH_USER_IDENTITY:-${VAUTH_USER_MAIL:-}}}"
+
+classify_key() {
+  local first_line
+  if [ -n "$KEY" ] && [ -f "$KEY" ]; then
+    IFS= read -r first_line < "$KEY" || true
+    case "$first_line" in
+      ssh-*|ecdsa-sha2-*|sk-ssh-*|sk-ecdsa-*) ;;
+      *) KEY_FILE="$KEY" ;;
+    esac
+  fi
+}
 
 get_agent_keys() {
   ssh-add -L
@@ -84,8 +96,22 @@ resolve_key() {
 }
 
 check_algo() {
-  local algo
-  algo=$(printf '%s\n' "$1" | awk '{print $1}')
+  local algo key_info
+  if [ -n "$KEY_FILE" ]; then
+    # -l can inspect encrypted OpenSSH keys without unlocking them. Signing
+    # may still use the agent, or ssh-keygen's existing passphrase prompt.
+    # A regular input descriptor avoids ssh-keygen preferring a stale .pub
+    # sibling; do not pipe the private key (the reader needs to seek).
+    key_info=$(ssh-keygen -lf /dev/stdin < "$KEY_FILE") || fail "Unable to inspect key file: $KEY_FILE"
+    case "${key_info##* }" in
+      '(RSA)') algo=ssh-rsa ;;
+      '(ED25519)') algo=ssh-ed25519 ;;
+      '(ECDSA)') algo="ecdsa-sha2-nistp${key_info%% *}" ;;
+      *) algo="${key_info##* }" ;;
+    esac
+  else
+    algo=$(printf '%s\n' "$1" | awk '{print $1}')
+  fi
 
   case "$algo" in
     ssh-rsa|rsa-sha2-256|rsa-sha2-512|ssh-ed25519) ;;
@@ -94,16 +120,17 @@ check_algo() {
   esac
 }
 
+# derive_keys <salt_b64> <pubkey> <namespace>
 derive_keys() {
-  local material source
+  local material source namespace="$3"
 
   source="from ssh-agent"
   [ -n "$KEY_FILE" ] && source="from key file: $KEY_FILE"
   material=$(
     if [ -n "$KEY_FILE" ]; then
-      printf '%s' "$1" | ssh-keygen -Y sign -f "$KEY_FILE" -n file 2>/dev/null
+      printf '%s' "$1" | ssh-keygen -Y sign -f /dev/fd/3 -n "$namespace" 3< "$KEY_FILE" 2>/dev/null
     else
-      printf '%s' "$1" | ssh-keygen -Y sign -f <(printf '%s\n' "$2") -n file 2>/dev/null
+      printf '%s' "$1" | ssh-keygen -Y sign -f <(printf '%s\n' "$2") -n "$namespace" 2>/dev/null
     fi |
       awk '/BEGIN SSH SIGNATURE/{f=1;next}/END SSH SIGNATURE/{f=0}f' |
       tr -d '\n' |
@@ -122,23 +149,25 @@ encrypt() {
   # Read upstream completely before contacting the agent; keep binary input in memory.
   input_b64=$(openssl base64 -A)
 
+  [ -n "$KEY" ] || KEY="$DEFAULT_KEY"
+  classify_key
   pubkey=$(resolve_key)
-  [ -n "$KEY_FILE" ] || check_algo "$pubkey"
+  check_algo "$pubkey"
   if [ -n "$KEY_FILE" ]; then
-    fingerprint=$(ssh-keygen -lf "$KEY_FILE" | awk '{print $2}')
+    fingerprint=$(ssh-keygen -lf /dev/stdin < "$KEY_FILE" | awk '{print $2}')
   else
     fingerprint=$(printf '%s\n' "$pubkey" | ssh-keygen -lf /dev/stdin | awk '{print $2}')
   fi
 
   salt_b64=$(openssl rand -base64 32 | tr -d '\n')
   iv_hex=$(openssl rand -hex 16 | tr -d '\n')
-  keys=$(derive_keys "$salt_b64" "$pubkey") || fail "Unable to derive encryption keys"
+  keys=$(derive_keys "$salt_b64" "$pubkey" "$NAMESPACE") || fail "Unable to derive encryption keys"
   read -r enc_key mac_key <<< "$keys"
 
   ciphertext_b64=$(printf '%s' "$input_b64" | openssl base64 -d -A |
     openssl enc -aes-256-cbc -K "$enc_key" -iv "$iv_hex" -nosalt -base64 -A)
   payload="$fingerprint.$salt_b64.$iv_hex.$ciphertext_b64"
-  mac=$(printf '%s' "$payload" |
+  mac=$(printf '%s%s' "$FORMAT_PREFIX" "$payload" |
     openssl dgst -sha256 -mac HMAC -macopt "hexkey:$mac_key" -hex -r |
     awk '{print $1}')
 
@@ -146,27 +175,43 @@ encrypt() {
 }
 
 decrypt() {
-  local line rest salt_b64 iv_hex ciphertext_b64 mac enc_key mac_key expected_mac payload fingerprint pubkey keys
+  local line rest salt_b64 iv_hex ciphertext_b64 mac enc_key mac_key expected_mac payload fingerprint pubkey keys namespace authenticated
 
   read -r line || fail "Missing payload"
   case "$line" in
     "$FORMAT_PREFIX"*)
       rest=${line#"$FORMAT_PREFIX"}
-      payload=${rest%.*}
+      namespace="$NAMESPACE"
+      authenticated="$FORMAT_PREFIX"
+      ;;
+    ssh-agent-crypt:v2:*)
+      rest=${line#ssh-agent-crypt:v2:}
+      namespace="$LEGACY_NAMESPACE"
+      authenticated=
+      ;;
+    ssh-agent-crypt:v1:*)
+      rest=${line#ssh-agent-crypt:v1:}
+      namespace="$LEGACY_NAMESPACE"
+      authenticated=
+      ;;
+    *) fail "Unsupported format header" ;;
+  esac
+  payload=${rest%.*}
+  case "$line" in
+    ssh-agent-crypt:v1:*)
+      [ -n "$KEY" ] || KEY="$DEFAULT_KEY"
+      ;;
+    *)
       fingerprint=${rest%%.*}
       [[ "$fingerprint" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || fail "Invalid key fingerprint"
       [ -n "$KEY" ] || KEY="$fingerprint"
       rest=${rest#*.}
       ;;
-    ssh-agent-crypt:v1:*)
-      rest=${line#ssh-agent-crypt:v1:}
-      payload=${rest%.*}
-      ;;
-    *) fail "Unsupported format header" ;;
   esac
 
+  classify_key
   pubkey=$(resolve_key)
-  [ -n "$KEY_FILE" ] || check_algo "$pubkey"
+  check_algo "$pubkey"
 
   salt_b64=${rest%%.*}
   rest=${rest#*.}
@@ -178,9 +223,9 @@ decrypt() {
   mac=${rest##*.}
   [ "$ciphertext_b64" != "$rest" ] || fail "Missing MAC"
 
-  keys=$(derive_keys "$salt_b64" "$pubkey") || fail "Unable to derive encryption keys"
+  keys=$(derive_keys "$salt_b64" "$pubkey" "$namespace") || fail "Unable to derive encryption keys"
   read -r enc_key mac_key <<< "$keys"
-  expected_mac=$(printf '%s' "$payload" |
+  expected_mac=$(printf '%s%s' "$authenticated" "$payload" |
     openssl dgst -sha256 -mac HMAC -macopt "hexkey:$mac_key" -hex -r |
     awk '{print $1}')
   [ "$expected_mac" = "$mac" ] || fail "Authentication failed"
