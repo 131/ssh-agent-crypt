@@ -3,3 +3,5 @@ node_modules
 /ssh-agent-crypt.exe
 package-lock.json
 
+dist/
+.gh-actions/

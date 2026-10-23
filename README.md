@@ -142,3 +142,6 @@ The Go CLI mirrors the Bash one and builds for Linux and Windows:
 go install github.com/131/ssh-agent-crypt/cmd/ssh-agent-crypt@latest
 echo "ok" | ssh-agent-crypt | ssh-agent-crypt -decrypt
 ```
+
+Prebuilt `linux-amd64` and `windows-amd64` binaries (with `SHA256SUMS`) are
+attached to each [GitHub release](https://github.com/131/ssh-agent-crypt/releases).
