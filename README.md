@@ -6,11 +6,30 @@ Encrypt and decrypt with the SSH key you already have loaded.
 No private key export. No extra key file. No sidecar secret store.
 `ssh-agent` is already part of your daily flow. That is enough.
 
-## Install / Quick Round-Trip
+## Install
+
+### As a binary from GitHub releases
+
+Standalone `ssh-agent-crypt` for Linux and `ssh-agent-crypt.exe` for Windows
+(signed), with `SHA256SUMS`, on every
+[release](https://github.com/131/ssh-agent-crypt/releases). Drop it in your
+`PATH`; it only needs a running agent.
+
+### As a Go module
+
+```bash
+go install github.com/131/ssh-agent-crypt/cmd/ssh-agent-crypt@latest
+```
+
+### As a Node module
 
 ```bash
 npm install -g ssh-agent-crypt
+```
 
+## Quick round-trip
+
+```bash
 echo "ok" | ssh-agent-crypt | ssh-agent-crypt -decrypt
 ok
 ```
@@ -136,12 +155,4 @@ entropy source). `Decrypt` returns the raw bytes. `DefaultAgentAddress`,
 `DialAgent` and, on Windows, `PageantPipeName` are exported for programs
 sharing the agent transport.
 
-The Go CLI mirrors the Bash one and builds for Linux and Windows:
-
-```bash
-go install github.com/131/ssh-agent-crypt/cmd/ssh-agent-crypt@latest
-echo "ok" | ssh-agent-crypt | ssh-agent-crypt -decrypt
-```
-
-Prebuilt `linux-amd64` and `windows-amd64` binaries (with `SHA256SUMS`) are
-attached to each [GitHub release](https://github.com/131/ssh-agent-crypt/releases).
+The Go CLI mirrors the Bash one; it is the binary attached to releases.
