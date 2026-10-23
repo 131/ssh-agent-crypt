@@ -28,7 +28,7 @@ module for your own code.
 
 ### Portable Bash
 
-One file, no dependencies beyond `ssh-keygen` and `openssl`. Read it before
+One file, no dependencies beyond `ssh-keygen` and `openssl`. [Read it](bin/ssh-agent-crypt) before
 you run it; it is short.
 
 ```bash
