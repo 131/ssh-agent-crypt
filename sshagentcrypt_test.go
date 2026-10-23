@@ -84,7 +84,16 @@ func (a *testAgent) createKey(comment, keyType string) string {
 
 func (a *testAgent) addKey(path string) {
 	a.t.Helper()
-	a.run("ssh-add", nil, "-q", path)
+	// Git does not keep 0600; ssh-add refuses "too open" keys, so load a private copy.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		a.t.Fatal(err)
+	}
+	copy := filepath.Join(a.t.TempDir(), filepath.Base(path))
+	if err := os.WriteFile(copy, data, 0o600); err != nil {
+		a.t.Fatal(err)
+	}
+	a.run("ssh-add", nil, "-q", copy)
 }
 
 func (a *testAgent) options() *Options {

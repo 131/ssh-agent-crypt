@@ -61,8 +61,17 @@ function stopAgent(env) {
 }
 
 function addKey(env, keyPath) {
-  const result = run("ssh-add", [keyPath], {env});
-  assertSuccess(result, "ssh-add " + keyPath);
+  // Git does not keep 0600; ssh-add refuses "too open" keys, so load a private copy.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-agent-crypt-key-"));
+  const copy = path.join(dir, path.basename(keyPath));
+  fs.copyFileSync(keyPath, copy);
+  fs.chmodSync(copy, 0o600);
+  try {
+    const result = run("ssh-add", [copy], {env});
+    assertSuccess(result, "ssh-add " + keyPath);
+  } finally {
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
 }
 
 async function listAgentKeys(env) {

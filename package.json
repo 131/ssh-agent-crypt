@@ -12,7 +12,8 @@
     "index.js",
     "bin/ssh-agent-crypt.js",
     "bin/ssh-agent-crypt",
-    "README.md"
+    "README.md",
+    "API_and_tests.md"
   ],
   "repository": {
     "type": "git",
