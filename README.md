@@ -160,7 +160,7 @@ scoring Coolness, Robustness and Safety out of 20:
 
 | Criterion | Codex (Claude Fable 5.1) | Codex (GPT 6.1) |
 | --- | ---: | ---: |
-| ✨ **Coolness** | **16/20** | **18/20** |
+| ✨ **Coolness** | 16/20 | 18/20 |
 | Robustness | 16/20 | 16/20 |
 | Safety | 14/20 | 15/20 |
 
