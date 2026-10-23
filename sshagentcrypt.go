@@ -179,7 +179,7 @@ func connectAgent(options *Options) (agent.ExtendedAgent, func(), error) {
 	if address == "" {
 		return nil, nil, errors.New("No ssh-agent (SSH_AUTH_SOCK is not set)")
 	}
-	conn, err := dialAgent(address)
+	conn, err := DialAgent(address)
 	if err != nil {
 		return nil, nil, fmt.Errorf("Unable to list ssh-agent keys: %w", err)
 	}
