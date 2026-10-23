@@ -80,9 +80,10 @@ Bash CLI:
 
 Node and Go implementations only need a reachable agent at `SSH_AUTH_SOCK`
 (Unix socket, or a Windows named pipe such as `\\.\pipe\openssh-ssh-agent`).
-On Windows, the OpenSSH agent exposes that pipe natively; with PuTTY, use
-Pageant 0.75 or later and point `SSH_AUTH_SOCK` at its OpenSSH-compatible
-named pipe (`pageant --openssh-config <file>` writes it as `IdentityAgent`).
+On Windows without `SSH_AUTH_SOCK`, the Go implementation connects to the
+running Pageant (0.75 or later, whose named pipe is derived the way PuTTY
+does it), and falls back to the Windows OpenSSH agent pipe; the Node
+implementation uses the legacy Pageant window protocol.
 
 ## Tests
 
@@ -130,8 +131,10 @@ plaintext, err := sshagentcrypt.Decrypt([]byte(armored), "", nil)
 ```
 
 Both functions accept the same key selector as the CLI and an optional
-`*Options` (`AgentSocket` overrides `SSH_AUTH_SOCK`, `Rand` the entropy
-source). `Decrypt` returns the raw bytes.
+`*Options` (`AgentSocket` overrides `DefaultAgentAddress()`, `Rand` the
+entropy source). `Decrypt` returns the raw bytes. `DefaultAgentAddress`,
+`DialAgent` and, on Windows, `PageantPipeName` are exported for programs
+sharing the agent transport.
 
 The Go CLI mirrors the Bash one and builds for Linux and Windows:
 

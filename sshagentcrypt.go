@@ -37,7 +37,7 @@ var fingerprintPattern = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]{43}$`)
 // process environment and uses crypto/rand.
 type Options struct {
 	// AgentSocket is the ssh-agent address: a Unix socket path, or a named
-	// pipe on Windows. Empty means SSH_AUTH_SOCK.
+	// pipe on Windows. Empty means DefaultAgentAddress (SSH_AUTH_SOCK).
 	AgentSocket string
 	// Rand is the entropy source for salt and IV; nil means crypto/rand.
 	Rand io.Reader
@@ -47,7 +47,7 @@ func (o *Options) agentSocket() string {
 	if o != nil && o.AgentSocket != "" {
 		return o.AgentSocket
 	}
-	return os.Getenv("SSH_AUTH_SOCK")
+	return DefaultAgentAddress()
 }
 
 func (o *Options) rand() io.Reader {
