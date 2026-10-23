@@ -17,49 +17,30 @@ ok
 
 Pick whichever fits the machine in front of you; all four speak the same format.
 
-### npm
-
 ```bash
+# node
 npm install -g ssh-agent-crypt
-```
 
-Installs the Node CLI (`bin/ssh-agent-crypt.js`) and the `ssh-agent-crypt`
-module for your own code.
-
-### Portable Bash
-
-One file, no dependencies beyond `ssh-keygen` and `openssl`. [Read it](bin/ssh-agent-crypt) before
-you run it; it is short.
-
-```bash
+# portable bash (one file, needs ssh-keygen and openssl; read it, it is short)
 curl -fsSL https://raw.githubusercontent.com/131/ssh-agent-crypt/master/bin/ssh-agent-crypt > ssh-agent-crypt
 chmod +x ssh-agent-crypt
-```
 
-### Binary
+# go
+go install github.com/131/ssh-agent-crypt/cmd/ssh-agent-crypt@latest
 
-Standalone, static, signed on Windows, with `SHA256SUMS` on every
-[release](https://github.com/131/ssh-agent-crypt/releases).
-
-```bash
-# Linux
+# static binary, linux
 wget -O ssh-agent-crypt https://github.com/131/ssh-agent-crypt/releases/latest/download/ssh-agent-crypt-linux-amd64
 chmod +x ssh-agent-crypt
-```
 
-```bat
-:: Windows (curl.exe ships with every supported Windows, cmd or PowerShell)
+# static binary, windows (curl.exe ships with every supported Windows, cmd or PowerShell)
 curl.exe -fsSL -o ssh-agent-crypt.exe https://github.com/131/ssh-agent-crypt/releases/latest/download/ssh-agent-crypt-windows-amd64.exe
 ```
 
-On Windows the binary talks to `SSH_AUTH_SOCK` when set, else to a running
-Pageant (0.75+), else to the OpenSSH agent pipe.
-
-### Go
-
-```bash
-go install github.com/131/ssh-agent-crypt/cmd/ssh-agent-crypt@latest
-```
+The npm package carries the Node CLI, the [Bash script](bin/ssh-agent-crypt)
+and the `ssh-agent-crypt` module. Binaries are static, signed on Windows, with
+`SHA256SUMS` on every [release](https://github.com/131/ssh-agent-crypt/releases).
+On Windows the agent is `SSH_AUTH_SOCK` when set, else a running Pageant
+(0.75+), else the OpenSSH agent pipe.
 
 ## Usage
 
