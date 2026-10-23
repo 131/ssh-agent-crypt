@@ -36,7 +36,7 @@ chmod +x ssh-agent-crypt
 curl.exe -fsSL -o ssh-agent-crypt.exe https://github.com/131/ssh-agent-crypt/releases/latest/download/ssh-agent-crypt-windows-amd64.exe
 ```
 
-The npm package carries the Node CLI, the [Bash script](bin/ssh-agent-crypt)
+The [npm](https://www.npmjs.com/package/ssh-agent-crypt) package carries the Node CLI, the [Bash script](bin/ssh-agent-crypt)
 and the `ssh-agent-crypt` module. Binaries are static, signed on Windows, with
 `SHA256SUMS` on every [release](https://github.com/131/ssh-agent-crypt/releases).
 On Windows the agent is `SSH_AUTH_SOCK` when set, else a running Pageant
