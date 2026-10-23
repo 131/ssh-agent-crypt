@@ -452,3 +452,36 @@ test('Bash decrypt/encrypt pipeline preserves binary input and trailing newlines
     assert.deepEqual(decoded.stdout, input);
   });
 });
+
+const GO_AVAILABLE = run("bash", ["-c", "command -v go"]).status === 0;
+
+test('Go CLI interoperates with Bash and Node', {skip: !GO_AVAILABLE && 'go not available'}, async () => {
+  const {encrypt, decrypt} = require('..');
+  await withAgent(async ({tmpDir, env}) => {
+    const goBinary = path.join(tmpDir, 'ssh-agent-crypt-go');
+    assertSuccess(run('go', ['build', '-o', goBinary, './cmd/ssh-agent-crypt'], {cwd: REPO_ROOT, env}), 'go build');
+    for(const type of ['ed25519', 'rsa']) {
+      const key = createKey(tmpDir, `go-${type}@test`, type);
+      addKey(env, key.privateKey);
+      const plaintext = `Go ${type}: coucou bibou 🐻\n`;
+      const goArmor = run(goBinary, [key.comment], {env, input: plaintext});
+      assertSuccess(goArmor, 'Go encrypts');
+      assert.match(goArmor.stdout, /^ssh-agent-crypt:v2:SHA256:/);
+      const bash = run('bash', [CLI_PATH, '-decrypt'], {env, input: goArmor.stdout});
+      assertSuccess(bash, 'Bash decrypts Go');
+      assert.equal(bash.stdout, plaintext);
+      assert.equal(await decrypt(goArmor.stdout, undefined, {env}), plaintext);
+      const bashArmor = run('bash', [CLI_PATH, key.comment], {env, input: plaintext});
+      assertSuccess(bashArmor, 'Bash encrypts');
+      const goFromBash = run(goBinary, ['-decrypt'], {env, input: bashArmor.stdout});
+      assertSuccess(goFromBash, 'Go decrypts Bash');
+      assert.equal(goFromBash.stdout, plaintext);
+      const goFromNode = run(goBinary, ['-decrypt'], {env, input: await encrypt(plaintext, key.comment, {env})});
+      assertSuccess(goFromNode, 'Go decrypts Node');
+      assert.equal(goFromNode.stdout, plaintext);
+    }
+    const tampered = run(goBinary, ['-decrypt'], {env, input: 'ssh-agent-crypt:v2:SHA256:' + 'A'.repeat(43) + '.c2FsdA==.00.AA==.00\n'});
+    assert.notEqual(tampered.status, 0);
+    assert.equal(tampered.stdout, '');
+  });
+});

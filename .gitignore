@@ -1,2 +1,3 @@
 node_modules
-
+/ssh-agent-crypt
+/ssh-agent-crypt.exe

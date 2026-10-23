@@ -72,18 +72,29 @@ ECDSA is not supported.
 
 ## Requirements
 
+Bash CLI:
+
 - `bash`
 - `openssl`
 - `ssh-agent`, `ssh-add`, `ssh-keygen`
 
+Node and Go implementations only need a reachable agent at `SSH_AUTH_SOCK`
+(Unix socket, or a Windows named pipe such as `\\.\pipe\openssh-ssh-agent`).
+On Windows, the OpenSSH agent exposes that pipe natively; with PuTTY, use
+Pageant 0.75 or later and point `SSH_AUTH_SOCK` at its OpenSSH-compatible
+named pipe (`pageant --openssh-config <file>` writes it as `IdentityAgent`).
+
 ## Tests
 
-Bash and JavaScript are both canonical implementations of the same v2 format.
-Tests verify encryption and decryption in both directions. The test harness
-uses the local `ssh-agent-js` dev dependency.
+Bash, JavaScript and Go are canonical implementations of the same v2 format.
+Tests verify encryption and decryption in every direction. The Node harness
+uses the local `ssh-agent-js` dev dependency and exercises the Go CLI when
+`go` is on `PATH`; the Go tests spawn a throwaway `ssh-agent` and cross-check
+against the Bash CLI and, when `node_modules` is installed, the Node API.
 
 ```bash
 npm test
+go test ./...
 ```
 
 ## Credits
@@ -104,3 +115,27 @@ const plaintext = await decrypt(armored);
 
 Both functions accept an optional key selector and an environment override:
 `encrypt(input, key, {env})`. Both return promises with UTF-8 output; failures reject.
+
+## Go API and CLI
+
+The Go module shares the repository tag with the npm package
+(`github.com/131/ssh-agent-crypt@vX.Y.Z`). It uses `golang.org/x/crypto/ssh`
+for agent access, key parsing and SSH signatures, no subprocesses:
+
+```go
+import sshagentcrypt "github.com/131/ssh-agent-crypt"
+
+armored, err := sshagentcrypt.Encrypt([]byte("secret"), "", nil)
+plaintext, err := sshagentcrypt.Decrypt([]byte(armored), "", nil)
+```
+
+Both functions accept the same key selector as the CLI and an optional
+`*Options` (`AgentSocket` overrides `SSH_AUTH_SOCK`, `Rand` the entropy
+source). `Decrypt` returns the raw bytes.
+
+The Go CLI mirrors the Bash one and builds for Linux and Windows:
+
+```bash
+go install github.com/131/ssh-agent-crypt/cmd/ssh-agent-crypt@latest
+echo "ok" | ssh-agent-crypt | ssh-agent-crypt -decrypt
+```
