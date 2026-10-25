@@ -35,6 +35,9 @@ func TestCLIUsageMatchesNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Stat(filepath.Join(root, "node_modules", "ssh2")); err != nil {
+		t.Skip("Node dependencies unavailable")
+	}
 	for _, args := range [][]string{{"--bad"}, {"-decrypt", "--bad"}, {"-decrypt", "a", "b"}, {"a", "b"}} {
 		goArgs := append([]string{"-test.run=TestCLIProcess", "--"}, args...)
 		goCmd := exec.Command(binary, goArgs...)
