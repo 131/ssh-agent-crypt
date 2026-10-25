@@ -1,5 +1,8 @@
 # ssh-agent-crypt
 
+Node.js 16 or newer is supported; CI includes Node 16 JavaScript syntax and
+module/CLI loading checks alongside the existing test suites.
+
 ## ssh-agent is enough
 
 Encrypt and decrypt with the SSH key you already have loaded.

@@ -25,3 +25,16 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
       - run: GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/ssh-agent-crypt
+
+  runtime-node16:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '16.x'
+      - run: npm install --omit=dev --ignore-scripts --engine-strict --no-audit
+      - run: |
+          node --check index.js
+          node --check bin/ssh-agent-crypt.js
+          node -e "require('./index.js')"
