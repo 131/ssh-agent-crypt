@@ -139,6 +139,12 @@ scoring Coolness, Robustness and Safety out of 20:
 [SECURITY_AUDIT_fable-5.1.md](SECURITY_AUDIT_fable-5.1.md) and
 [SECURITY_AUDIT_gpt-6.1-sol.md](SECURITY_AUDIT_gpt-6.1-sol.md).
 
+| Criterion | Codex (Claude Fable 5.1) | Codex (GPT 6.1) |
+| --- | ---: | ---: |
+| ✨ **Coolness** | 16/20 | 18/20 |
+| Robustness | 16/20 | 16/20 |
+| Safety | 14/20 | 15/20 |
+
 ## Credits
 
 - [Francois Leurent/131](https://github.com/131)
