@@ -1,6 +1,6 @@
 module github.com/131/ssh-agent-crypt
 
-// version: 1.3.3
+// version: 1.4.2
 
 go 1.22
 
