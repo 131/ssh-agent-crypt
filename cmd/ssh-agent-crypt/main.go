@@ -29,7 +29,7 @@ Notes:
   - Format:
       ssh-agent-crypt:v3:<fingerprint>.<salt_b64>.<iv_hex>.<ciphertext_b64>.<mac_hex>
     (v2 and v1 payloads remain readable)
-`, os.Args[0])
+`, "ssh-agent-crypt")
 	os.Exit(1)
 }
 
@@ -45,6 +45,9 @@ func main() {
 			usage()
 		}
 		if len(args) > 1 {
+			if strings.HasPrefix(args[1], "-") {
+				usage()
+			}
 			selector = args[1]
 		}
 	case strings.HasPrefix(args[0], "-"), len(args) > 1:
